@@ -44,11 +44,15 @@
                 setExpandedFuncs(prev => ({ ...prev, [key]: !prev[key] }));
             };
 
-            const pollResults = useCallback((jobId) => {
+            const pollResults = useCallback((jobId, failedPolls = 0) => {
                 if (pollingRef.current) clearInterval(pollingRef.current);
                 pollingRef.current = setInterval(async () => {
                     try {
                         const res = await fetch(`${API}/results/${jobId}`);
+                        if (!res.ok) {
+                            if (res.status === 404) throw new Error("job-not-found");
+                            throw new Error(`HTTP ${res.status}`);
+                        }
                         const data = await res.json();
                         if (data.status === "complete" || data.status === "error") {
                             clearInterval(pollingRef.current);
@@ -65,39 +69,69 @@
                             setProgress(data.progress || "Processing...");
                         }
                     } catch (err) {
-                        clearInterval(pollingRef.current);
-                        setError("Failed to poll results");
-                        setLoading(false);
-                        setView("upload");
+                        // Tolerate transient failures (Render restarts/cold starts can interrupt a poll)
+                        if (failedPolls >= 5) {
+                            clearInterval(pollingRef.current);
+                            setError("Backend became unavailable while analyzing. If the server restarted, the job was lost — please try again.");
+                            setLoading(false);
+                            setView("upload");
+                        } else {
+                            pollResults(jobId, failedPolls + 1);
+                        }
                     }
                 }, 3000);
             }, []);
 
             useEffect(() => {
+                // Wake the Render backend (free tier sleeps after ~15 min of inactivity)
+                fetch(`${API}/health`).catch(() => {});
                 return () => {
                     if (pollingRef.current) clearInterval(pollingRef.current);
                 };
             }, []);
 
+            const uploadWithColdStartRetry = async (file) => {
+                const formData = new FormData();
+                formData.append("file", file);
+                let lastErr = null;
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        setProgress(attempt > 1
+                            ? `Waking up backend (cold start)... attempt ${attempt}/3`
+                            : "Uploading...");
+                        const res = await fetch(`${API}/analyze`, { method: "POST", body: formData });
+                        if (!res.ok) {
+                            let detail = `Backend returned HTTP ${res.status}`;
+                            try { detail = (await res.json()).detail || detail; } catch (e) {}
+                            throw new Error(detail);
+                        }
+                        const data = await res.json();
+                        if (data.status === "error") {
+                            setError(data.message || "Analysis failed");
+                            setLoading(false);
+                            return;
+                        }
+                        return data.job_id;
+                    } catch (err) {
+                        lastErr = err;
+                        if (attempt < 3) {
+                            await new Promise(r => setTimeout(r, 20000));
+                        }
+                    }
+                }
+                throw lastErr;
+            };
 
             const handleUpload = async (file) => {
                 if (!file) return;
                 setLoading(true);
                 setError(null);
                 setProgress("Uploading...");
-                const formData = new FormData();
-                formData.append("file", file);
                 try {
-                    const res = await fetch(`${API}/analyze`, { method: "POST", body: formData });
-                    const data = await res.json();
-                    if (data.status === "error") {
-                        setError(data.message);
-                        setLoading(false);
-                        return;
-                    }
-                    pollResults(data.job_id);
+                    const jobId = await uploadWithColdStartRetry(file);
+                    pollResults(jobId);
                 } catch (err) {
-                    setError("Failed to connect to backend");
+                    setError("Failed to connect to backend. The Render server may be sleeping — a cold start takes 30-60 seconds. Please try again, or use the demo below.");
                     setLoading(false);
                 }
             };
