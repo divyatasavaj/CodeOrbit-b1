@@ -1,1 +1,1 @@
-{"outputDirectory":".","buildCommand":"echo static","rewrites":[{"source":"/(.*)","destination":"/index.html"}]}
+{"outputDirectory":"dist","buildCommand":"npm run build","rewrites":[{"source":"/(.*)","destination":"/index.html"}]}

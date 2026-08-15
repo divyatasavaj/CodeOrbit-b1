@@ -2,3 +2,5 @@
 serve.log
 serve.err.log
 .env*
+node_modules
+dist
