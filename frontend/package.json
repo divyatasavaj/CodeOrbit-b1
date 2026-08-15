@@ -5,6 +5,7 @@
   "description": "CodeOracle frontend",
   "scripts": {
     "dev": "npx --yes serve -p 3000 .",
-    "start": "npx --yes serve -p 3000 ."
+    "start": "npx --yes serve -p 3000 .",
+    "build": "echo CodeOracle static build complete"
   }
 }
