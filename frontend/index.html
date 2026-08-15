@@ -26,9 +26,7 @@
     <script type="text/babel">
         const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
-        const API = (window.location.protocol.startsWith("http") && window.location.origin !== "null")
-            ? window.location.origin
-            : "http://127.0.0.1:8000";
+        const API = "https://codeorbit-wi1m.onrender.com";
 
         function App() {
             const [view, setView] = useState("upload");
