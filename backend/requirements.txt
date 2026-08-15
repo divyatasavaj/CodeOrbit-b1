@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+google-genai
+pymongo[srv]
+python-dotenv
+pytest
+pytest-cov
