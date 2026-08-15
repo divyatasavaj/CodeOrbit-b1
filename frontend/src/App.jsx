@@ -246,7 +246,7 @@ export default function App() {
                         </div>
 
                         <h1 className="hero-title" style={{ marginBottom: "1.25rem" }}>
-                            High-performance<br />AI Code Analysis
+                            High-performance<br />Code Analysis
                         </h1>
                         <p className="hero-sub" style={{ marginBottom: "2rem" }}>
                             Automatically understand, test, and refactor legacy codebases
