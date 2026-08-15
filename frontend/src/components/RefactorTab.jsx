@@ -76,13 +76,6 @@ export default function RefactorTab({ refactor }) {
                 <div key={i} className="bg-gray-800 rounded-xl p-6">
                     <div className="flex items-center justify-between mb-4">
                         <span className="font-mono text-green-400 font-medium text-lg">{item.name}()</span>
-                        <span className={`px-3 py-1 rounded text-sm font-medium ${
-                            item.tests_verified
-                                ? "bg-green-900/50 text-green-300"
-                                : "bg-yellow-900/50 text-yellow-300"
-                        }`}>
-                            {item.tests_verified ? "Tests Verified ✅" : "⚠️ Unverified"}
-                        </span>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
