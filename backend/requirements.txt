@@ -6,3 +6,4 @@ pymongo[srv]
 python-dotenv
 pytest
 pytest-cov
+httpx

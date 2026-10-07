@@ -1,4 +1,6 @@
 import React, { useState, useMemo, useCallback } from "react";
+import FunctionPicker from "./FunctionPicker.jsx";
+import { API } from "../api.js";
 
 /**
  * Hard numeric threshold for code coverage compliance (PS-06 requirement).
@@ -88,7 +90,7 @@ function CopyButton({ code }) {
                     ? "bg-emerald-950/90 border-emerald-500 text-emerald-300 shadow-sm shadow-emerald-950"
                     : copyFailed
                     ? "bg-rose-950/90 border-rose-500 text-rose-300"
-                    : "bg-gray-800 hover:bg-gray-700 border-gray-700 text-gray-300 hover:text-white"
+                    : "bg-gray-800 hover:bg-gray-700 border-gray-700 text-gray-300 hover:text-fg"
             }`}
             title="Copy test code to clipboard"
         >
@@ -127,11 +129,49 @@ function CopyButton({ code }) {
  * @param {Object} props
  * @param {Array<Object>} [props.tests] - Array of test result objects from /results/{job_id}
  * @param {boolean} [props.isLoading=false] - Loading indicator for initial data retrieval
+ * @param {Array<Object>} [props.explanation] - File groups used by the on-demand picker
+ * @param {string|null} [props.jobId] - Job id for the on-demand generation endpoint
+ * @param {Function} [props.onUpdate] - Functional updater to merge generated entries into results
  */
-export default function TestsTab({ tests, isLoading = false }) {
+export default function TestsTab({ tests, isLoading = false, explanation, jobId, onUpdate }) {
     const [searchQuery, setSearchQuery] = useState("");
     const [filterMode, setFilterMode] = useState("all"); // 'all' | 'meets' | 'below' | 'passed' | 'failed'
     const [expandedOutputs, setExpandedOutputs] = useState({});
+    const [generating, setGenerating] = useState(null); // function name in flight
+    const [genError, setGenError] = useState("");
+    const [pickerOpen, setPickerOpen] = useState(false);
+
+    const handleGenerate = async (functionName, filename) => {
+        if (!jobId) {
+            setGenError("Analysis job ID is missing — please run a new analysis.");
+            return;
+        }
+        setGenerating(functionName);
+        setGenError("");
+        try {
+            const res = await fetch(`${API}/generate/tests/${jobId}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ function_name: functionName, filename })
+            });
+            if (!res.ok) {
+                let detail = `HTTP ${res.status}`;
+                try { detail = (await res.json()).detail || detail; } catch (e) {}
+                throw new Error(detail);
+            }
+            const entry = await res.json();
+            if (onUpdate) {
+                onUpdate(prev => ({
+                    ...prev,
+                    tests: [...(prev.tests || []).filter(t => t.name !== entry.name), entry]
+                }));
+            }
+        } catch (err) {
+            setGenError(err.message || "Test generation failed. Please try again.");
+        } finally {
+            setGenerating(null);
+        }
+    };
 
     // 1. Normalize test items to handle variations in API naming contracts safely
     const normalizedTests = useMemo(() => {
@@ -158,6 +198,19 @@ export default function TestsTab({ tests, isLoading = false }) {
             };
         });
     }, [tests]);
+
+    // Names already generated (for picker "Generated"/"Regenerate" states)
+    const generatedNames = useMemo(() => new Set(normalizedTests.map(t => t.name)), [normalizedTests]);
+
+    const errorBanner = genError ? (
+        <div className="flex items-start gap-2.5 bg-rose-950/60 border border-rose-800/80 rounded-xl px-4 py-3 text-sm text-rose-300">
+            <svg className="w-4 h-4 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="flex-1">{genError}</span>
+            <button type="button" onClick={() => setGenError("")} className="text-rose-400 hover:text-rose-200 font-bold leading-none" title="Dismiss">✕</button>
+        </div>
+    ) : null;
 
     // 2. Compute Summary Metrics
     const totalCount = normalizedTests.length;
@@ -237,20 +290,21 @@ export default function TestsTab({ tests, isLoading = false }) {
     }
 
     // -------------------------------------------------------------
-    // RENDER: Empty State (Zero Tests)
+    // RENDER: Empty State — on-demand picker (tests are generated per function)
     // -------------------------------------------------------------
     if (totalCount === 0) {
         return (
-            <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-12 text-center my-6 shadow-xl backdrop-blur-sm">
-                <div className="w-16 h-16 bg-gray-700/50 rounded-2xl flex items-center justify-center mx-auto mb-4 text-gray-400">
-                    <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-                    </svg>
-                </div>
-                <h3 className="text-xl font-semibold text-gray-200 mb-2">No Tests Were Generated</h3>
-                <p className="text-gray-400 text-sm max-w-md mx-auto leading-relaxed">
-                    No unit tests were produced for the selected codebase. Ensure source files contain testable functions and rerun analysis.
-                </p>
+            <div className="space-y-4">
+                {errorBanner}
+                <FunctionPicker
+                    explanation={explanation}
+                    existingNames={generatedNames}
+                    generatingName={generating}
+                    generateLabel="Generate Tests"
+                    title="Generate Tests On Demand"
+                    description="The initial analysis produces explanations and the dependency graph only — skipping test generation to save time. Pick any function below to generate its unit test suite with real coverage (one AI call per function, a few seconds)."
+                    onGenerate={handleGenerate}
+                />
             </div>
         );
     }
@@ -260,13 +314,49 @@ export default function TestsTab({ tests, isLoading = false }) {
     // -------------------------------------------------------------
     return (
         <div className="space-y-6">
+            {errorBanner}
+
+            {/* On-demand generation: add tests for another function */}
+            {pickerOpen ? (
+                <div className="space-y-2">
+                    <FunctionPicker
+                        explanation={explanation}
+                        existingNames={generatedNames}
+                        generatingName={generating}
+                        generateLabel="Generate Tests"
+                        title="Generate Tests For Another Function"
+                        description="One AI call per function. Results appear in the list below as soon as coverage finishes running."
+                        onGenerate={handleGenerate}
+                    />
+                    <div className="flex justify-end">
+                        <button
+                            type="button"
+                            onClick={() => setPickerOpen(false)}
+                            className="text-xs text-gray-400 hover:text-fg px-3 py-1.5 rounded-lg border border-gray-700 hover:border-gray-500 transition-colors cursor-pointer"
+                        >
+                            Hide Picker
+                        </button>
+                    </div>
+                </div>
+            ) : (
+                <button
+                    type="button"
+                    onClick={() => setPickerOpen(true)}
+                    className="w-full py-3 rounded-xl border border-dashed border-gray-700 hover:border-blue-500/60 hover:bg-blue-500/5 text-sm text-gray-400 hover:text-blue-300 font-medium transition-all duration-150 cursor-pointer flex items-center justify-center gap-2"
+                >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    Generate tests for another function
+                </button>
+            )}
             {/* 1. Summary Header Card */}
             <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-6 shadow-xl backdrop-blur-sm space-y-5">
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                     {/* Primary Requirement: "X of Y functions meet the 60% threshold" */}
                     <div>
                         <div className="flex items-center gap-3">
-                            <h3 className="text-lg md:text-xl font-bold text-white tracking-tight">
+                            <h3 className="text-lg md:text-xl font-bold text-fg tracking-tight">
                                 <span className={meetsThresholdCount === totalCount ? "text-emerald-400" : meetsThresholdCount > 0 ? "text-blue-400" : "text-rose-400"}>
                                     {meetsThresholdCount} of {totalCount}
                                 </span>{" "}
@@ -340,7 +430,7 @@ export default function TestsTab({ tests, isLoading = false }) {
                         {searchQuery && (
                             <button
                                 onClick={() => setSearchQuery("")}
-                                className="absolute right-3 top-2.5 text-xs text-gray-400 hover:text-white"
+                                className="absolute right-3 top-2.5 text-xs text-gray-400 hover:text-fg"
                                 type="button"
                             >
                                 ✕

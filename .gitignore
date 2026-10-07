@@ -30,6 +30,7 @@ Thumbs.db
 
 # Cache & Benchmarks
 backend/.cache/
+backend/cache/
 benchmark_results.json
 backend/.env
 

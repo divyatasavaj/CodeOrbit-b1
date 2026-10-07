@@ -316,13 +316,13 @@ export default function ExplanationTab({ explanation, functions, isLoading = fal
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         placeholder="Search functions by name..."
-                        className="w-full bg-gray-900/90 border border-gray-700 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 text-white placeholder-gray-500 text-sm rounded-xl pl-10 pr-10 py-2.5 outline-none transition-all"
+                        className="w-full bg-gray-900/90 border border-gray-700 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 text-fg placeholder-gray-500 text-sm rounded-xl pl-10 pr-10 py-2.5 outline-none transition-all"
                         id="function-search-input"
                     />
                     {searchQuery && (
                         <button
                             onClick={clearSearch}
-                            className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-white transition-colors cursor-pointer"
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-fg transition-colors cursor-pointer"
                             title="Clear search"
                             type="button"
                         >
@@ -345,7 +345,7 @@ export default function ExplanationTab({ explanation, functions, isLoading = fal
 
                     <button
                         onClick={toggleExpandAll}
-                        className="flex items-center gap-2 bg-gray-700 hover:bg-gray-600 active:bg-gray-750 text-gray-200 hover:text-white text-xs font-medium px-4 py-2.5 rounded-xl border border-gray-600/60 transition-all shadow-sm whitespace-nowrap cursor-pointer"
+                        className="flex items-center gap-2 bg-gray-700 hover:bg-gray-600 active:bg-gray-750 text-gray-200 hover:text-fg text-xs font-medium px-4 py-2.5 rounded-xl border border-gray-600/60 transition-all shadow-sm whitespace-nowrap cursor-pointer"
                         id="toggle-expand-all-btn"
                         type="button"
                     >
@@ -411,9 +411,14 @@ export default function ExplanationTab({ explanation, functions, isLoading = fal
                                 </p>
                             )}
                         </div>
-                        <span className="text-xs text-gray-400 font-mono bg-gray-800/80 px-2.5 py-1 rounded-md border border-gray-700/60 self-start md:self-auto whitespace-nowrap">
-                            {fileData.filteredFunctions.length} {fileData.filteredFunctions.length === 1 ? "function" : "functions"}
-                        </span>
+                        <div className="flex items-center gap-2 self-start md:self-auto">
+                            <span className="text-xs font-mono text-gray-400 bg-gray-800/80 px-2.5 py-1 rounded-md border border-gray-700/60 whitespace-nowrap">
+                                AI {fileData.filteredFunctions.filter(f => (f.ai_status === "ai" || f.ai_status === "cached")).length}/{fileData.filteredFunctions.length}
+                            </span>
+                            <span className="text-xs text-gray-400 font-mono bg-gray-800/80 px-2.5 py-1 rounded-md border border-gray-700/60 whitespace-nowrap">
+                                {fileData.filteredFunctions.length} {fileData.filteredFunctions.length === 1 ? "function" : "functions"}
+                            </span>
+                        </div>
                     </div>
 
                     {/* Function Cards List */}
@@ -436,6 +441,22 @@ export default function ExplanationTab({ explanation, functions, isLoading = fal
                                             <span className="font-mono text-green-400 font-semibold text-base">
                                                 {func.name}()
                                             </span>
+                                            {func.ai_status === "static" && (
+                                                <span
+                                                    className="text-[10px] uppercase tracking-wider font-semibold text-gray-500 bg-gray-700/40 border border-gray-600/50 rounded px-1.5 py-0.5"
+                                                    title="Deterministic static analysis shown; the AI explanation is still generating"
+                                                >
+                                                    AI pending
+                                                </span>
+                                            )}
+                                            {(func.ai_status === "ai" || func.ai_status === "cached") && (
+                                                <span
+                                                    className="text-[10px] uppercase tracking-wider font-semibold text-blue-300 bg-blue-500/10 border border-blue-500/30 rounded px-1.5 py-0.5"
+                                                    title="AI-generated explanation"
+                                                >
+                                                    AI
+                                                </span>
+                                            )}
                                         </div>
 
                                         {/* Expand / Collapse Chevron */}
@@ -443,7 +464,7 @@ export default function ExplanationTab({ explanation, functions, isLoading = fal
                                             <span className="text-xs hidden sm:inline text-gray-500 font-mono">
                                                 {isExpanded ? "Collapse" : "Details"}
                                             </span>
-                                            <div className="w-8 h-8 rounded-lg bg-gray-700/50 flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+                                            <div className="w-8 h-8 rounded-lg bg-gray-700/50 flex items-center justify-center text-gray-400 hover:text-fg transition-colors">
                                                 <svg
                                                     className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? "rotate-180 text-blue-400" : ""}`}
                                                     fill="none"

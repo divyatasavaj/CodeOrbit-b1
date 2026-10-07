@@ -1,367 +1,546 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useCallback } from "react";
+import {
+    ReactFlow,
+    ReactFlowProvider,
+    MiniMap,
+    Controls,
+    Background,
+    BackgroundVariant,
+    Handle,
+    Position,
+    MarkerType,
+    useNodesState,
+    useEdgesState,
+    useReactFlow,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import dagre from "@dagrejs/dagre";
 
 /**
  * GraphTab Component for CodeOracle
- * 
- * Visualizes multi-file code dependencies, module imports, and function call relationships
- * using Mermaid.js with structured node/edge metrics, zoom/pan controls, error handling,
- * and loading skeletons.
- * 
+ *
+ * Interactive dependency graph built on React Flow:
+ * - Dagre layered auto-layout (left-to-right) so nothing overlaps or bunches up
+ * - Full-viewport canvas that fills the available screen space
+ * - Clean, uniform node cards with type badges — every node is draggable
+ * - Arrow labels appear on hover / selection so first-time users can read relationships
+ * - Click a node to open a plain-English detail panel with its connections
+ * - Search box to find and jump to any node
+ *
  * @param {Object} props
- * @param {Object} props.graph - The dependency graph object from /results/{job_id}
- * @param {string} [props.graph.mermaid] - Pre-formatted Mermaid.js diagram definition
- * @param {Array<Object>} [props.graph.nodes] - Array of node objects [{ id, name, type, file, line }]
- * @param {Array<Object>} [props.graph.edges] - Array of edge objects [{ from, to, type }]
- * @param {boolean} [props.isLoading=false] - Loading indicator for initial data retrieval
+ * @param {Object} props.graph - graph object from /results/{job_id}
+ * @param {Array<Object>} props.graph.nodes - [{ id, name, type, file, line, description }]
+ * @param {Array<Object>} props.graph.edges - [{ from, to, type, label }]
+ * @param {boolean} [props.isLoading=false]
  */
-export default function GraphTab({ graph, isLoading = false }) {
-    const [renderError, setRenderError] = useState(null);
-    const [isRendering, setIsRendering] = useState(false);
-    const [zoomLevel, setZoomLevel] = useState(1);
-    const [showRawCode, setShowRawCode] = useState(false);
-    const [copied, setCopied] = useState(false);
-    const containerRef = useRef(null);
-    const renderIdRef = useRef(0);
-    const svgWrapperRef = useRef(null);
-    const contentSizeRef = useRef({ width: 0, height: 0 });
-    const zoomRef = useRef(1);
-    const MIN_ZOOM = 0.25;
-    const MAX_ZOOM = 20;
 
-    // 1. Structured Node & Edge Counts (Derived from actual arrays, never parsed from string)
-    const nodes = useMemo(() => (graph && Array.isArray(graph.nodes) ? graph.nodes : []), [graph]);
-    const edges = useMemo(() => (graph && Array.isArray(graph.edges) ? graph.edges : []), [graph]);
-    const mermaidCode = useMemo(() => (graph && typeof graph.mermaid === "string" ? graph.mermaid.trim() : ""), [graph]);
+const NODE_W = 236;
+const NODE_H = 84;
+
+/* Theme-keyed palettes: dark = original design, light = darkened for contrast */
+const NODE_COLORS = {
+    dark: {
+        file: "#38bdf8",
+        class: "#818cf8",
+        function: "#34d399",
+        method: "#a78bfa",
+        module: "#f472b6",
+        external: "#fbbf24",
+    },
+    light: {
+        file: "#0284c7",
+        class: "#4f46e5",
+        function: "#047857",
+        method: "#6d28d9",
+        module: "#be185d",
+        external: "#b45309",
+    },
+};
+
+const EDGE_COLORS = {
+    dark: {
+        contains: "#64748b",
+        imports: "#f472b6",
+        calls: "#34d399",
+    },
+    light: {
+        contains: "#64748b",
+        imports: "#db2777",
+        calls: "#059669",
+    },
+};
+
+function useTheme() {
+    const [theme, setTheme] = useState(() => document.documentElement.getAttribute("data-theme") || "dark");
+    useEffect(() => {
+        const sync = () => setTheme(document.documentElement.getAttribute("data-theme") || "dark");
+        window.addEventListener("co-theme-change", sync);
+        return () => window.removeEventListener("co-theme-change", sync);
+    }, []);
+    return theme;
+}
+
+const TYPE_META = {
+    file: { label: "File", icon: "📄" },
+    class: { label: "Class", icon: "🏛" },
+    function: { label: "Function", icon: "⚙" },
+    method: { label: "Method", icon: "🧩" },
+    module: { label: "Import", icon: "📦" },
+    external: { label: "External", icon: "🔗" },
+};
+
+const EDGE_META = {
+    contains: { dashed: false },
+    imports: { dashed: true },
+    calls: { dashed: false },
+};
+
+const FALLBACK_NODE_LEGEND = [
+    { type: "file", label: "File", icon: "📄", color: "#38bdf8", description: "A source file from your project." },
+    { type: "class", label: "Class", icon: "🏛", color: "#818cf8", description: "A class definition found in your code." },
+    { type: "function", label: "Function", icon: "⚙", color: "#34d399", description: "A function defined in your project." },
+    { type: "method", label: "Method", icon: "🧩", color: "#a78bfa", description: "A method that lives inside a class." },
+    { type: "module", label: "Import", icon: "📦", color: "#f472b6", description: "A module or package your file imports." },
+    { type: "external", label: "External call", icon: "🔗", color: "#fbbf24", description: "Called by your code but not defined in the analyzed files." },
+];
+
+const FALLBACK_EDGE_LEGEND = [
+    { type: "contains", label: "contains", style: "solid", color: "#64748b", description: "A file contains this class or function." },
+    { type: "imports", label: "imports", style: "dashed", color: "#f472b6", description: "A file loads this module or package." },
+    { type: "calls", label: "calls", style: "solid", color: "#34d399", description: "One function invokes another." },
+];
+
+const REL_PHRASES = {
+    calls: { out: "calls", in: "called by" },
+    contains: { out: "contains", in: "part of" },
+    imports: { out: "imports", in: "imported by" },
+};
+
+/* ------------------------------------------------------------------ */
+/* Custom node: uniform rounded card, type badge, name, file subtitle  */
+/* ------------------------------------------------------------------ */
+function CodeNode({ data, selected }) {
+    const showSub = data.file && data.nodeType !== "file" && data.nodeType !== "module";
+    return (
+        <div
+            className={`co-node${selected ? " co-node--selected" : ""}${data.highlight ? " co-node--highlight" : ""}`}
+            style={{ "--nc": data.color, "--nc-soft": `${data.color}26`, "--nc-mid": `${data.color}59` }}
+            title={data.description}
+        >
+            <Handle type="target" position={Position.Left} />
+            <span className="co-node-badge" aria-hidden="true">{data.icon}</span>
+            <span className="co-node-text">
+                <span className="co-node-type">{data.typeLabel}</span>
+                <span className="co-node-name">{data.name}</span>
+                {showSub && <span className="co-node-sub">{data.file}{data.line ? `:${data.line}` : ""}</span>}
+            </span>
+            <Handle type="source" position={Position.Right} />
+        </div>
+    );
+}
+
+const nodeTypes = { code: CodeNode };
+
+/* ------------------------------------------------------------------ */
+/* Build React Flow nodes/edges from backend payload                   */
+/* ------------------------------------------------------------------ */
+function normalizeGraph(graph, theme = "dark") {
+    const nodeColors = NODE_COLORS[theme] || NODE_COLORS.dark;
+    const edgeColors = EDGE_COLORS[theme] || EDGE_COLORS.dark;
+    const rawNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    const nodeIds = new Set(rawNodes.map((n) => n.id));
+
+    const rfEdges = (Array.isArray(graph?.edges) ? graph.edges : [])
+        .map((e, i) => {
+            const source = e.from ?? e.source;
+            const target = e.to ?? e.target;
+            if (!source || !target || !nodeIds.has(source) || !nodeIds.has(target)) return null;
+            const type = String(e.type || e.edge_type || "calls").toLowerCase();
+            const meta = EDGE_META[type] || EDGE_META.calls;
+            const color = edgeColors[type] || edgeColors.calls;
+            return {
+                id: `edge-${i}-${source}-${target}`,
+                source,
+                target,
+                type: "smoothstep",
+                label: e.label || type,
+                data: { edgeType: type },
+                style: {
+                    stroke: color,
+                    strokeWidth: 1.7,
+                    strokeDasharray: meta.dashed ? "7 5" : undefined,
+                },
+                markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color },
+            };
+        })
+        .filter(Boolean);
+
+    const rfNodes = rawNodes.map((n, i) => {
+        const meta = TYPE_META[n.type] || TYPE_META.function;
+        return {
+            id: n.id,
+            type: "code",
+            position: { x: (i % 6) * (NODE_W + 56), y: Math.floor(i / 6) * (NODE_H + 48) },
+            deletable: false,
+            connectable: false,
+            data: {
+                name: n.name || n.id,
+                nodeType: n.type || "function",
+                typeLabel: meta.label,
+                icon: meta.icon,
+                color: nodeColors[n.type] || nodeColors.function,
+                file: n.file || "",
+                line: n.line || 0,
+                description: n.description || `${meta.label} "${n.name || n.id}"`,
+                highlight: false,
+            },
+        };
+    });
+
+    return { rfNodes, rfEdges };
+}
+
+/* ------------------------------------------------------------------ */
+/* Dagre layered layout — spreads nodes evenly, no overlap             */
+/* ------------------------------------------------------------------ */
+function layoutWithDagre(nodes, edges) {
+    const g = new dagre.graphlib.Graph();
+    g.setGraph({ rankdir: "LR", ranksep: 110, nodesep: 46, marginx: 64, marginy: 64 });
+    g.setDefaultEdgeLabel(() => ({}));
+
+    nodes.forEach((n) => g.setNode(n.id, { width: NODE_W, height: NODE_H }));
+    edges.forEach((e) => {
+        if (g.hasNode(e.source) && g.hasNode(e.target)) g.setEdge(e.source, e.target);
+    });
+
+    try {
+        dagre.layout(g);
+    } catch (_) {
+        return nodes;
+    }
+
+    return nodes.map((n) => {
+        const p = g.node(n.id);
+        if (!p) return n;
+        return { ...n, position: { x: Math.round(p.x - NODE_W / 2), y: Math.round(p.y - NODE_H / 2) } };
+    });
+}
+
+/* ------------------------------------------------------------------ */
+/* Detail panel shown when a node is clicked                           */
+/* ------------------------------------------------------------------ */
+function NodeInfoPanel({ node, connections, onClose }) {
+    if (!node) return null;
+    const d = node.data;
+    return (
+        <div className="co-node-panel">
+            <button type="button" className="co-node-panel-close" onClick={onClose} title="Close details">×</button>
+            <div className="co-node-panel-head">
+                <span className="co-node-panel-badge" style={{ color: d.color, background: `${d.color}1f`, borderColor: `${d.color}59` }}>
+                    {d.icon}
+                </span>
+                <div style={{ minWidth: 0 }}>
+                    <div className="co-node-panel-type" style={{ color: d.color }}>{d.typeLabel}</div>
+                    <div className="co-node-panel-name">{d.name}</div>
+                </div>
+            </div>
+            {d.file && (
+                <div className="co-node-panel-loc">
+                    {d.file}{d.line ? ` · line ${d.line}` : ""}
+                </div>
+            )}
+            <p className="co-node-panel-desc">{d.description}</p>
+            {connections.length > 0 && (
+                <div className="co-node-panel-rels">
+                    <div className="co-node-panel-rels-title">Connections ({connections.length})</div>
+                    {connections.slice(0, 10).map((c) => (
+                        <div key={c.id} className="co-node-panel-rel">
+                            <span className="co-node-panel-arrow">{c.arrow}</span>
+                            <span className="co-node-panel-phrase">{c.phrase}</span>
+                            <span className="co-node-panel-target">{c.name}</span>
+                        </div>
+                    ))}
+                    {connections.length > 10 && (
+                        <div className="co-node-panel-more">+ {connections.length - 10} more</div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/* ------------------------------------------------------------------ */
+/* Canvas: header, legend, search, React Flow surface                  */
+/* ------------------------------------------------------------------ */
+function GraphCanvas({ graph }) {
+    const theme = useTheme();
+    const { rfNodes, rfEdges } = useMemo(() => normalizeGraph(graph, theme), [graph, theme]);
+    const initialNodes = useMemo(() => layoutWithDagre(rfNodes, rfEdges), [rfNodes, rfEdges]);
+
+    const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+    const [edges, setEdges, onEdgesChange] = useEdgesState(rfEdges);
+    const [selectedId, setSelectedId] = useState(null);
+    const [query, setQuery] = useState("");
+    const { setCenter } = useReactFlow();
+
+    // Re-color nodes/edges when the theme changes (drag positions are preserved)
+    useEffect(() => {
+        const nodeColors = NODE_COLORS[theme] || NODE_COLORS.dark;
+        const edgeColors = EDGE_COLORS[theme] || EDGE_COLORS.dark;
+        setNodes((ns) =>
+            ns.map((n) => {
+                const color = nodeColors[n.data.nodeType] || nodeColors.function;
+                return n.data.color === color ? n : { ...n, data: { ...n.data, color } };
+            })
+        );
+        setEdges((es) =>
+            es.map((e) => {
+                const t = e.data?.edgeType || "calls";
+                const color = edgeColors[t] || edgeColors.calls;
+                if (e.style?.stroke === color) return e;
+                return {
+                    ...e,
+                    style: { ...e.style, stroke: color },
+                    markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color },
+                };
+            })
+        );
+    }, [theme, setNodes, setEdges]);
+
+    const totalNodes = rfNodes.length;
+    const totalEdges = rfEdges.length;
 
     const nodeStats = useMemo(() => {
-        const stats = { file: 0, func: 0, cls: 0, module: 0 };
-        for (const n of nodes) {
-            const type = (n.type || "").toLowerCase();
-            if (type === "file") stats.file++;
-            else if (type === "class") stats.cls++;
-            else if (type === "module") stats.module++;
+        const stats = { file: 0, func: 0, cls: 0, module: 0, external: 0 };
+        for (const n of rfNodes) {
+            const t = n.data.nodeType;
+            if (t === "file") stats.file++;
+            else if (t === "class") stats.cls++;
+            else if (t === "module") stats.module++;
+            else if (t === "external") stats.external++;
             else stats.func++;
         }
         return stats;
-    }, [nodes]);
+    }, [rfNodes]);
 
+    const matchCount = useMemo(() => {
+        const q = query.trim().toLowerCase();
+        if (!q) return 0;
+        return nodes.filter((n) => n.data.name.toLowerCase().includes(q)).length;
+    }, [query, nodes]);
+
+    // Highlight nodes matching the search query
+    useEffect(() => {
+        const q = query.trim().toLowerCase();
+        setNodes((ns) =>
+            ns.map((n) => {
+                const highlight = !!q && n.data.name.toLowerCase().includes(q);
+                return n.data.highlight === highlight ? n : { ...n, data: { ...n.data, highlight } };
+            })
+        );
+    }, [query, setNodes]);
+
+    const highlightConnections = useCallback((id) => {
+        setEdges((es) =>
+            es.map((e) => {
+                const selected = id != null && (e.source === id || e.target === id);
+                return e.selected === selected ? e : { ...e, selected };
+            })
+        );
+    }, [setEdges]);
+
+    const handleNodeClick = useCallback((_, node) => {
+        setSelectedId(node.id);
+        highlightConnections(node.id);
+    }, [highlightConnections]);
+
+    const handlePaneClick = useCallback(() => {
+        setSelectedId(null);
+        highlightConnections(null);
+    }, [highlightConnections]);
+
+    const handleSearchKeyDown = useCallback((e) => {
+        if (e.key !== "Enter") return;
+        const q = query.trim().toLowerCase();
+        if (!q) return;
+        const hit = nodes.find((n) => n.data.name.toLowerCase().includes(q));
+        if (hit) {
+            setSelectedId(hit.id);
+            highlightConnections(hit.id);
+            setCenter(hit.position.x + NODE_W / 2, hit.position.y + NODE_H / 2, { zoom: 1.05, duration: 550 });
+        }
+    }, [query, nodes, setCenter, highlightConnections]);
+
+    const selectedNode = selectedId ? nodes.find((n) => n.id === selectedId) : null;
+
+    const connections = useMemo(() => {
+        if (!selectedId) return [];
+        const nameById = new Map(nodes.map((n) => [n.id, n.data.name]));
+        return edges
+            .filter((e) => e.source === selectedId || e.target === selectedId)
+            .map((e) => {
+                const outgoing = e.source === selectedId;
+                const otherId = outgoing ? e.target : e.source;
+                const rel = REL_PHRASES[e.data?.edgeType] || REL_PHRASES.calls;
+                return {
+                    id: e.id,
+                    arrow: outgoing ? "→" : "←",
+                    phrase: outgoing ? rel.out : rel.in,
+                    name: nameById.get(otherId) || otherId,
+                };
+            });
+    }, [selectedId, edges, nodes]);
+
+    const nodeLegend = graph?.legend?.nodes?.length ? graph.legend.nodes : FALLBACK_NODE_LEGEND;
+    const edgeLegend = graph?.legend?.edges?.length ? graph.legend.edges : FALLBACK_EDGE_LEGEND;
+    const nodeColors = NODE_COLORS[theme] || NODE_COLORS.dark;
+    const edgeColors = EDGE_COLORS[theme] || EDGE_COLORS.dark;
+
+    return (
+        <div className="space-y-3">
+            {/* Header: metrics + search */}
+            <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-4 shadow-lg backdrop-blur-sm flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
+                <div className="flex flex-wrap items-center gap-2.5">
+                    <div className="flex items-center gap-2 px-3.5 py-1.5 bg-gray-900/90 border border-blue-500/30 rounded-xl text-xs font-semibold text-blue-300">
+                        <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+                        <span>{totalNodes} Nodes</span>
+                    </div>
+                    <div className="flex items-center gap-2 px-3.5 py-1.5 bg-gray-900/90 border border-emerald-500/30 rounded-xl text-xs font-semibold text-emerald-300">
+                        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                        </svg>
+                        <span>{totalEdges} Relationships</span>
+                    </div>
+                    <div className="hidden lg:flex items-center gap-2 text-xs text-gray-400 pl-2 border-l border-gray-700">
+                        {nodeStats.file > 0 && <span>📄 {nodeStats.file} Files</span>}
+                        {nodeStats.func > 0 && <span>⚙ {nodeStats.func} Functions</span>}
+                        {nodeStats.cls > 0 && <span>🏛 {nodeStats.cls} Classes</span>}
+                        {nodeStats.module > 0 && <span>📦 {nodeStats.module} Imports</span>}
+                        {nodeStats.external > 0 && <span>🔗 {nodeStats.external} External</span>}
+                    </div>
+                </div>
+
+                {/* Search */}
+                <div className="relative flex items-center">
+                    <svg className="w-4 h-4 absolute left-3 text-gray-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-4.35-4.35M17 11a6 6 0 11-12 0 6 6 0 0112 0z" />
+                    </svg>
+                    <input
+                        type="text"
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={handleSearchKeyDown}
+                        placeholder="Find a node… (press Enter to jump)"
+                        className="co-search-input"
+                        aria-label="Search graph nodes"
+                    />
+                    {query.trim() && (
+                        <span className="absolute right-3 text-[10px] font-semibold text-gray-500">
+                            {matchCount} found
+                        </span>
+                    )}
+                </div>
+            </div>
+
+            {/* Legend */}
+            <div className="co-legend">
+                <div className="co-legend-group">
+                    <span className="co-legend-title">Shapes</span>
+                    {nodeLegend.map((item) => {
+                        const icon = item.icon || TYPE_META[item.type]?.icon || "•";
+                        const color = nodeColors[item.type] || item.color;
+                        return (
+                            <span key={item.type} className="co-legend-chip" title={item.description}>
+                                <span className="co-legend-swatch" style={{ background: `${color}1f`, borderColor: `${color}59`, color }}>{icon}</span>
+                                <span>{item.label}</span>
+                            </span>
+                        );
+                    })}
+                </div>
+                <div className="co-legend-group">
+                    <span className="co-legend-title">Arrows</span>
+                    {edgeLegend.map((item) => {
+                        const color = edgeColors[item.type] || item.color;
+                        return (
+                            <span key={item.type} className="co-legend-chip" title={item.description}>
+                                <span className={`co-legend-line${item.style === "dashed" ? " dashed" : ""}`} style={{ borderColor: color }}></span>
+                                <span>{item.label} →</span>
+                            </span>
+                        );
+                    })}
+                </div>
+                <div className="co-graph-hint">
+                    Drag nodes to rearrange · Scroll to zoom · Click a node for details
+                </div>
+            </div>
+
+            {/* Canvas */}
+            <div className="co-graph-canvas co-graph" style={{ height: "clamp(520px, calc(100vh - 350px), 1000px)" }}>
+                <ReactFlow
+                    nodes={nodes}
+                    edges={edges}
+                    onNodesChange={onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    onNodeClick={handleNodeClick}
+                    onPaneClick={handlePaneClick}
+                    nodeTypes={nodeTypes}
+                    fitView
+                    fitViewOptions={{ padding: 0.14, maxZoom: 1.1 }}
+                    minZoom={0.05}
+                    maxZoom={2.5}
+                    nodesConnectable={false}
+                    deleteKeyCode={null}
+                    proOptions={{ hideAttribution: true }}
+                >
+                    <Background
+                        variant={BackgroundVariant.Dots}
+                        gap={26}
+                        size={1.5}
+                        color={theme === "light" ? "rgba(100,116,139,0.35)" : "rgba(148,163,184,0.20)"}
+                    />
+                    <Controls position="bottom-left" showInteractive />
+                    <MiniMap
+                        position="bottom-right"
+                        pannable
+                        zoomable
+                        nodeColor={(n) => n.data?.color || "#475569"}
+                        maskColor={theme === "light" ? "rgba(241,245,249,0.75)" : "rgba(8,12,20,0.78)"}
+                        style={{
+                            background: theme === "light" ? "#f1f5f9" : "#0a0e16",
+                            border: `1px solid ${theme === "light" ? "#e2e8f0" : "#1e293b"}`,
+                            borderRadius: 10,
+                        }}
+                    />
+                </ReactFlow>
+
+                <NodeInfoPanel
+                    node={selectedNode}
+                    connections={connections}
+                    onClose={() => { setSelectedId(null); highlightConnections(null); }}
+                />
+            </div>
+        </div>
+    );
+}
+
+/* ------------------------------------------------------------------ */
+/* Public component                                                    */
+/* ------------------------------------------------------------------ */
+export default function GraphTab({ graph, isLoading = false }) {
+    const nodes = useMemo(() => (Array.isArray(graph?.nodes) ? graph.nodes : []), [graph]);
+    const edges = useMemo(() => (Array.isArray(graph?.edges) ? graph.edges : []), [graph]);
     const totalNodes = nodes.length;
     const totalEdges = edges.length;
 
-    // 2. Mermaid Diagram Rendering Lifecycle
-    useEffect(() => {
-        if (isLoading || totalNodes === 0 || !mermaidCode) {
-            setRenderError(null);
-            return;
-        }
+    // Remount the canvas when the underlying analysis changes
+    const graphKey = useMemo(
+        () => `${totalNodes}:${totalEdges}:${nodes[0]?.id || ""}:${nodes[totalNodes - 1]?.id || ""}`,
+        [nodes, totalNodes, totalEdges]
+    );
 
-        const renderContainer = containerRef.current;
-        if (!renderContainer) return;
-
-        // Clear container completely to avoid stale DOM or duplicate elements
-        renderContainer.innerHTML = "";
-        setRenderError(null);
-        setIsRendering(true);
-
-        const currentRenderId = ++renderIdRef.current;
-        const uniqueElementId = `codeoracle_mermaid_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-
-        const renderDiagram = async () => {
-            try {
-                // Ensure mermaid is loaded globally
-                const mermaidApi = window.mermaid;
-                if (!mermaidApi) {
-                    throw new Error("Mermaid library is not loaded on the page.");
-                }
-
-                mermaidApi.initialize({
-                    startOnLoad: false,
-                    theme: "dark",
-                    securityLevel: "loose",
-                    flowchart: {
-                        useMaxWidth: false,
-                        htmlLabels: true,
-                        curve: "basis"
-                    }
-                });
-
-                // Execute render API
-                const { svg } = await mermaidApi.render(uniqueElementId, mermaidCode);
-
-                // Prevent race conditions if data changed during async render
-                if (currentRenderId !== renderIdRef.current || !containerRef.current) {
-                    return;
-                }
-
-                const svgWrapper = document.createElement("div");
-                svgWrapper.style.transformOrigin = "top left";
-                svgWrapper.style.flexShrink = "0";
-                svgWrapper.innerHTML = svg;
-
-                containerRef.current.innerHTML = "";
-                containerRef.current.appendChild(svgWrapper);
-                svgWrapperRef.current = svgWrapper;
-
-                const svgEl = svgWrapper.querySelector("svg");
-                const rect = svgEl ? svgEl.getBoundingClientRect() : null;
-                const naturalWidth = rect && rect.width ? rect.width : 100;
-                const naturalHeight = rect && rect.height ? rect.height : 100;
-                contentSizeRef.current = { width: naturalWidth, height: naturalHeight };
-
-                svgWrapper.style.transform = `scale(${zoomRef.current})`;
-
-                try { setupNodeDragging(svgEl); } catch (err) { console.warn("CodeOracle node drag setup warning:", err); }
-
-                setRenderError(null);
-            } catch (err) {
-                if (currentRenderId === renderIdRef.current) {
-                    console.warn("CodeOracle Mermaid render warning:", err);
-                    setRenderError(err?.message || "Failed to render visual dependency graph.");
-                }
-            } finally {
-                if (currentRenderId === renderIdRef.current) {
-                    setIsRendering(false);
-                }
-            }
-        };
-
-        renderDiagram();
-    }, [mermaidCode, totalNodes, isLoading]);
-
-    const parseEdgePathD = (d) => {
-        const segs = [];
-        const re = /([MLCQSTAZHV])\s*([-+0-9.,eE\s]*)/g;
-        let m;
-        while ((m = re.exec(d)) && m[1]) {
-            const cmd = m[1];
-            const nums = (m[2].match(/-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?/g) || []).map(Number);
-            if (cmd === "Z") { segs.push({ cmd, nums: [], pairs: [] }); continue; }
-            const pairs = [];
-            if (cmd === "M" || cmd === "L" || cmd === "T" || cmd === "C" || cmd === "S" || cmd === "Q") {
-                for (let i = 0; i + 1 < nums.length; i += 2) pairs.push([i, i + 1]);
-            } else if (cmd === "A") {
-                for (let i = 5; i + 1 < nums.length; i += 7) pairs.push([i, i + 1]);
-            } else if (cmd === "H") {
-                nums.forEach((_, i) => pairs.push([i]));
-            } else if (cmd === "V") {
-                nums.forEach((_, i) => pairs.push([i]));
-            }
-            if (pairs.length) segs.push({ cmd, nums, pairs });
-        }
-        return segs;
-    };
-
-    const computeEdgePoints = (segs) => {
-        const pts = [];
-        let x = 0, y = 0;
-        for (const seg of segs) {
-            for (const pair of seg.pairs) {
-                if (pair.length === 2) { x = seg.nums[pair[0]]; y = seg.nums[pair[1]]; }
-                else if (seg.cmd === "H") x = seg.nums[pair[0]];
-                else y = seg.nums[pair[0]];
-                pts.push({ x, y });
-            }
-        }
-        return pts;
-    };
-
-    const nearestNodeId = (nodes, pt) => {
-        let best = null, bestD = Infinity;
-        for (const n of nodes.values()) {
-            const d = (pt.x - n.cx) * (pt.x - n.cx) + (pt.y - n.cy) * (pt.y - n.cy);
-            if (d < bestD) { bestD = d; best = n.nodeId; }
-        }
-        return best;
-    };
-
-    const round1 = (v) => Math.round(v * 10) / 10;
-
-    const rebuildEdge = (edge, startNode, endNode) => {
-        const { segs, pts, lens, total } = edge;
-        const out = [];
-        let pi = 0;
-        for (const seg of segs) {
-            const nums = seg.nums.slice();
-            for (const pair of seg.pairs) {
-                const t = total ? lens[pi] / total : 0;
-                const dx = startNode.dx * (1 - t) + endNode.dx * t;
-                const dy = startNode.dy * (1 - t) + endNode.dy * t;
-                if (pair.length === 2) { nums[pair[0]] = round1(pts[pi].x + dx); nums[pair[1]] = round1(pts[pi].y + dy); }
-                else if (seg.cmd === "H") nums[pair[0]] = round1(pts[pi].x + dx);
-                else nums[pair[0]] = round1(pts[pi].y + dy);
-                pi++;
-            }
-            out.push(seg.cmd + nums.join(","));
-        }
-        edge.el.setAttribute("d", out.join(""));
-    };
-
-    const growSvgBounds = (svgEl, nodes) => {
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        let any = false;
-        for (const n of nodes.values()) {
-            if (!n.bb) continue;
-            minX = Math.min(minX, n.cx + n.dx + n.bb.x);
-            minY = Math.min(minY, n.cy + n.dy + n.bb.y);
-            maxX = Math.max(maxX, n.cx + n.dx + n.bb.x + n.bb.width);
-            maxY = Math.max(maxY, n.cy + n.dy + n.bb.y + n.bb.height);
-            any = true;
-        }
-        if (!any) return;
-        const pad = 24;
-        const w = (svgEl.width && svgEl.width.baseVal) ? svgEl.width.baseVal.value : 100;
-        const h = (svgEl.height && svgEl.height.baseVal) ? svgEl.height.baseVal.value : 100;
-        const cur = (svgEl.getAttribute("viewBox") || "0 0 100 100").split(/[\s,]+/).map(Number);
-        const cx0 = cur[0] || 0, cy0 = cur[1] || 0;
-        const cw = cur[2] || w, ch = cur[3] || h;
-        const nw = Math.max(maxX + pad, cx0 + cw) - cx0;
-        const nh = Math.max(maxY + pad, cy0 + ch) - cy0;
-        if (nw !== cw || nh !== ch) {
-            svgEl.setAttribute("viewBox", `${cx0} ${cy0} ${nw} ${nh}`);
-            if (svgEl.width && svgEl.width.baseVal) { svgEl.width.baseVal.value = nw; svgEl.height.baseVal.value = nh; }
-            else { svgEl.setAttribute("width", nw); svgEl.setAttribute("height", nh); }
-        }
-    };
-
-    const setupNodeDragging = (svgEl) => {
-        svgEl.style.overflow = "visible";
-        const nodes = new Map();
-        for (const g of svgEl.querySelectorAll("g.node")) {
-            const idMatch = (g.getAttribute("id") || "").match(/-flowchart-([A-Za-z0-9_]+)-\d+$/);
-            const tr = (g.getAttribute("transform") || "").match(/translate\(([-\d.]+),\s*([-\d.]+)\)/);
-            if (!idMatch || !tr) continue;
-            let bb = null;
-            try { bb = g.getBBox(); } catch (_) {}
-            nodes.set(idMatch[1], { el: g, nodeId: idMatch[1], cx: parseFloat(tr[1]), cy: parseFloat(tr[2]), dx: 0, dy: 0, bb });
-        }
-        if (nodes.size === 0) return;
-
-        const edges = [];
-        for (const path of svgEl.querySelectorAll(".edgePaths path")) {
-            const d = path.getAttribute("d");
-            if (!d) continue;
-            const segs = parseEdgePathD(d);
-            const pts = computeEdgePoints(segs);
-            if (pts.length < 2) continue;
-            const lens = [0];
-            let total = 0;
-            for (let i = 1; i < pts.length; i++) { total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y); lens.push(total); }
-            const startNode = nearestNodeId(nodes, pts[0]);
-            const endNode = nearestNodeId(nodes, pts[pts.length - 1]);
-            if (!startNode || !endNode) continue;
-            edges.push({ el: path, segs, pts, lens, total, startNode, endNode });
-        }
-
-        for (const node of nodes.values()) {
-            const g = node.el;
-            g.style.cursor = "grab";
-            g.style.userSelect = "none";
-            g.style.touchAction = "none";
-            let dragging = false, moved = false, startX = 0, startY = 0;
-            const onDown = (e) => {
-                if (e.pointerType === "mouse" && e.button !== 0) return;
-                e.preventDefault();
-                dragging = true;
-                moved = false;
-                startX = e.clientX;
-                startY = e.clientY;
-                g.style.cursor = "grabbing";
-                if (g.setPointerCapture) { try { g.setPointerCapture(e.pointerId); } catch (_) {} }
-            };
-            const onMove = (e) => {
-                if (!dragging) return;
-                const rawX = e.clientX - startX;
-                const rawY = e.clientY - startY;
-                if (!moved && Math.hypot(rawX, rawY) < 4) return;
-                moved = true;
-                const zoom = zoomRef.current || 1;
-                node.dx += rawX / zoom;
-                node.dy += rawY / zoom;
-                startX = e.clientX;
-                startY = e.clientY;
-                g.setAttribute("transform", `translate(${node.cx} ${node.cy}) translate(${round1(node.dx)} ${round1(node.dy)})`);
-                for (const edge of edges) {
-                    if (edge.startNode !== node.nodeId && edge.endNode !== node.nodeId) continue;
-                    const sn = nodes.get(edge.startNode);
-                    const en = nodes.get(edge.endNode);
-                    if (sn && en) rebuildEdge(edge, sn, en);
-                }
-                growSvgBounds(svgEl, nodes);
-            };
-            const onUp = (e) => {
-                if (!dragging) return;
-                dragging = false;
-                g.style.cursor = "grab";
-                if (g.releasePointerCapture) { try { g.releasePointerCapture(e.pointerId); } catch (_) {} }
-            };
-            g.addEventListener("pointerdown", onDown);
-            g.addEventListener("pointermove", onMove);
-            g.addEventListener("pointerup", onUp);
-            g.addEventListener("pointercancel", onUp);
-        }
-    };
-
-    // Copy Mermaid definition
-    const handleCopyCode = useCallback(() => {
-        if (!mermaidCode) return;
-        navigator.clipboard.writeText(mermaidCode).then(() => {
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
-        });
-    }, [mermaidCode]);
-
-    // Zoom Controls
-    const applyZoom = useCallback((nextZoom, anchorX, anchorY) => {
-        const wrap = svgWrapperRef.current;
-        const ctr = containerRef.current;
-        if (!wrap || !ctr) return;
-        const clamped = Math.min(Math.max(nextZoom, MIN_ZOOM), MAX_ZOOM);
-        const prevZoom = zoomRef.current;
-        const contentX = (ctr.scrollLeft + anchorX) / prevZoom;
-        const contentY = (ctr.scrollTop + anchorY) / prevZoom;
-        zoomRef.current = clamped;
-        setZoomLevel(clamped);
-        wrap.style.transform = `scale(${clamped})`;
-        ctr.scrollLeft = Math.max(0, contentX * clamped - anchorX);
-        ctr.scrollTop = Math.max(0, contentY * clamped - anchorY);
-    }, []);
-
-    const handleZoomIn = useCallback(() => {
-        const ctr = containerRef.current;
-        applyZoom(zoomRef.current * 1.35, ctr ? ctr.clientWidth / 2 : 0, ctr ? ctr.clientHeight / 2 : 0);
-    }, [applyZoom]);
-
-    const handleZoomOut = useCallback(() => {
-        const ctr = containerRef.current;
-        applyZoom(zoomRef.current / 1.35, ctr ? ctr.clientWidth / 2 : 0, ctr ? ctr.clientHeight / 2 : 0);
-    }, [applyZoom]);
-
-    const handleResetZoom = useCallback(() => {
-        const ctr = containerRef.current;
-        applyZoom(1, ctr ? ctr.clientWidth / 2 : 0, ctr ? ctr.clientHeight / 2 : 0);
-    }, [applyZoom]);
-
-    useEffect(() => {
-        const ctr = containerRef.current;
-        if (!ctr) return;
-        const onWheelNative = (e) => {
-            if (!e.ctrlKey && !e.metaKey) return;
-            e.preventDefault();
-            const rect = ctr.getBoundingClientRect();
-            const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-            applyZoom(zoomRef.current * factor, e.clientX - rect.left, e.clientY - rect.top);
-        };
-        ctr.addEventListener("wheel", onWheelNative, { passive: false });
-        return () => ctr.removeEventListener("wheel", onWheelNative);
-    }, [applyZoom, totalNodes]);
-
-    // -------------------------------------------------------------
-    // RENDER: Loading Skeleton State
-    // -------------------------------------------------------------
     if (isLoading) {
         return (
             <div className="space-y-4 animate-pulse">
-                {/* Header Skeleton */}
                 <div className="bg-gray-800/80 rounded-2xl p-4 border border-gray-700/60 flex items-center justify-between">
                     <div className="flex gap-3">
                         <div className="h-8 w-28 bg-gray-700 rounded-lg"></div>
@@ -369,7 +548,6 @@ export default function GraphTab({ graph, isLoading = false }) {
                     </div>
                     <div className="h-8 w-36 bg-gray-700 rounded-lg"></div>
                 </div>
-                {/* Canvas Skeleton */}
                 <div className="bg-gray-900 rounded-2xl border border-gray-800 p-8 min-h-[420px] flex flex-col items-center justify-center space-y-4">
                     <div className="w-12 h-12 border-4 border-blue-500/30 border-t-blue-500 rounded-full animate-spin"></div>
                     <p className="text-gray-400 text-sm font-medium">Constructing dependency graph...</p>
@@ -378,9 +556,6 @@ export default function GraphTab({ graph, isLoading = false }) {
         );
     }
 
-    // -------------------------------------------------------------
-    // RENDER: Zero-Nodes Fallback State
-    // -------------------------------------------------------------
     if (totalNodes === 0) {
         return (
             <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-12 text-center my-6 shadow-xl backdrop-blur-sm">
@@ -397,159 +572,11 @@ export default function GraphTab({ graph, isLoading = false }) {
         );
     }
 
-    // -------------------------------------------------------------
-    // RENDER: Active Graph View
-    // -------------------------------------------------------------
     return (
-        <div className="space-y-4">
-            {/* 1. Control & Metrics Header Bar */}
-            <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-4 shadow-lg backdrop-blur-sm flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
-                {/* Left: Structured Counts */}
-                <div className="flex flex-wrap items-center gap-2.5">
-                    <div className="flex items-center gap-2 px-3.5 py-1.5 bg-gray-900/90 border border-blue-500/30 rounded-xl text-xs font-semibold text-blue-300">
-                        <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
-                        <span>{totalNodes} Nodes</span>
-                    </div>
-
-                    <div className="flex items-center gap-2 px-3.5 py-1.5 bg-gray-900/90 border border-emerald-500/30 rounded-xl text-xs font-semibold text-emerald-300">
-                        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                        </svg>
-                        <span>{totalEdges} Calls & Imports</span>
-                    </div>
-
-                    {/* Breakdown Badges */}
-                    <div className="hidden lg:flex items-center gap-2 text-xs text-gray-400 pl-2 border-l border-gray-700">
-                        {nodeStats.file > 0 && <span>📁 {nodeStats.file} Files</span>}
-                        {nodeStats.func > 0 && <span>⚡ {nodeStats.func} Functions</span>}
-                        {nodeStats.cls > 0 && <span>🏛️ {nodeStats.cls} Classes</span>}
-                        {nodeStats.module > 0 && <span>📦 {nodeStats.module} Modules</span>}
-                    </div>
-                </div>
-
-                {/* Right: Interactive Zoom & View Controls */}
-                <div className="flex items-center gap-2 justify-end">
-                    {/* Zoom Buttons */}
-                    <div className="flex items-center bg-gray-900/80 border border-gray-700 rounded-xl p-1 text-xs">
-                        <button
-                            onClick={handleZoomOut}
-                            className="px-2.5 py-1 text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-colors cursor-pointer"
-                            title="Zoom Out"
-                            type="button"
-                        >
-                            −
-                        </button>
-                        <span className="px-2 text-gray-400 font-mono text-[11px]">
-                            {Math.round(zoomLevel * 100)}%
-                        </span>
-                        <button
-                            onClick={handleZoomIn}
-                            className="px-2.5 py-1 text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-colors cursor-pointer"
-                            title="Zoom In"
-                            type="button"
-                        >
-                            +
-                        </button>
-                        <button
-                            onClick={handleResetZoom}
-                            className="px-2 py-1 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors border-l border-gray-800 ml-1 cursor-pointer"
-                            title="Reset Zoom"
-                            type="button"
-                        >
-                            Reset
-                        </button>
-                    </div>
-
-                    {/* Toggle Raw Definition */}
-                    <button
-                        onClick={() => setShowRawCode(prev => !prev)}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors cursor-pointer ${
-                            showRawCode
-                                ? "bg-indigo-600/30 border-indigo-500/60 text-indigo-200"
-                                : "bg-gray-700 hover:bg-gray-600 border-gray-600/60 text-gray-200"
-                        }`}
-                        type="button"
-                    >
-                        {showRawCode ? "Hide Mermaid Code" : "View Code"}
-                    </button>
-                </div>
-            </div>
-
-            {/* 2. Legend Bar */}
-            <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 bg-gray-900/50 border border-gray-800/80 rounded-xl text-xs text-gray-400">
-                <div className="flex items-center gap-4">
-                    <span className="font-semibold text-gray-300">Legend:</span>
-                    <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded bg-[#38bdf8]"></span> File</span>
-                    <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded bg-[#34d399]"></span> Function</span>
-                    <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded bg-[#818cf8]"></span> Class</span>
-                    <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded bg-[#a78bfa]"></span> External Module</span>
-                </div>
-                <div className="text-[11px] text-gray-500">
-                    Scroll to pan · Ctrl + scroll or +/− to zoom (up to 2000%) · Drag a node to rearrange it
-                </div>
-            </div>
-
-            {/* 3. Raw Mermaid Code View (Optional Collapsible) */}
-            {showRawCode && (
-                <div className="relative bg-gray-950 rounded-2xl p-4 border border-indigo-500/30 shadow-inner">
-                    <div className="flex items-center justify-between pb-2 mb-2 border-b border-gray-800">
-                        <span className="text-xs font-semibold text-indigo-300 font-mono">Mermaid.js Definition</span>
-                        <button
-                            onClick={handleCopyCode}
-                            className="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-300 transition-colors cursor-pointer"
-                            type="button"
-                        >
-                            {copied ? "Copied!" : "Copy Definition"}
-                        </button>
-                    </div>
-                    <pre className="text-xs text-emerald-400 font-mono overflow-x-auto max-h-60 overflow-y-auto leading-relaxed">
-                        {mermaidCode}
-                    </pre>
-                </div>
-            )}
-
-            {/* 4. Scrollable Graph Canvas Container */}
-            <div className="relative bg-gray-950/90 rounded-2xl border border-gray-800 shadow-2xl overflow-hidden">
-                {/* Error Fallback Banner */}
-                {renderError ? (
-                    <div className="p-8 text-center space-y-4">
-                        <div className="w-12 h-12 bg-rose-950/80 border border-rose-800/60 rounded-xl flex items-center justify-center mx-auto text-rose-400">
-                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                            </svg>
-                        </div>
-                        <div>
-                            <h4 className="text-base font-semibold text-gray-200 mb-1">Visual Graph Rendering Notice</h4>
-                            <p className="text-xs text-rose-400/90 max-w-md mx-auto font-mono bg-rose-950/30 p-2.5 rounded-lg border border-rose-900/40">
-                                {renderError}
-                            </p>
-                        </div>
-                        <div className="pt-2">
-                            <button
-                                onClick={() => setShowRawCode(true)}
-                                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs font-medium rounded-xl border border-gray-700 transition-colors cursor-pointer"
-                                type="button"
-                            >
-                                View Raw Graph Definition
-                            </button>
-                        </div>
-                    </div>
-                ) : (
-                    /* Scrollable Diagram Area: min-height 420px, scrollable in both dimensions */
-                    <div
-                        ref={containerRef}
-                        className="w-full min-h-[420px] max-h-[720px] overflow-auto flex items-start cursor-grab active:cursor-grabbing"
-                        style={{ scrollbarWidth: "thin", touchAction: "pan-x pan-y" }}
-                    >
-                        {isRendering && (
-                            <div className="flex items-center justify-center py-24 text-gray-500 text-xs gap-2">
-                                <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div>
-                                <span>Rendering graph elements...</span>
-                            </div>
-                        )}
-                    </div>
-                )}
-            </div>
+        <div className="co-graph-breakout">
+            <ReactFlowProvider>
+                <GraphCanvas key={graphKey} graph={graph} />
+            </ReactFlowProvider>
         </div>
     );
 }

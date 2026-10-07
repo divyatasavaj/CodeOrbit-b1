@@ -3,10 +3,14 @@ import asyncio
 import difflib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 from google import genai
+
+import config
+import function_registry as registry_mod
 
 logger = logging.getLogger("codeoracle")
 
@@ -21,9 +25,11 @@ logger = logging.getLogger("codeoracle")
 
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
-MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
-SEM = asyncio.Semaphore(2)
+MODEL = config.MODEL
+FALLBACK_MODELS = list(dict.fromkeys([config.MODEL, "gemini-3.5-flash"]))
+# Global LLM concurrency limit shared by every call site (explanations, tests,
+# refactors, all jobs) so one large repository cannot monopolise the API.
+SEM = asyncio.Semaphore(config.LLM_CONCURRENCY)
 
 # Quick-results mode: generate full LLM explanations for this fraction of each
 # module's functions, then stop and fall back to the grounded AST engine for the
@@ -52,9 +58,11 @@ def _extract_response_text(response: Any) -> str:
     return ""
 
 
-async def generate_with_retry(prompt: str, retries: int = 5, initial_delay: float = 1.5) -> str:
+async def generate_with_retry(prompt: str, retries: Optional[int] = None, initial_delay: Optional[float] = None) -> str:
     """Execute Gemini generate_content with Semaphore, fallback models, and exponential backoff retry."""
     global client
+    retries = retries if retries is not None else config.LLM_MAX_RETRIES + 1
+    initial_delay = initial_delay if initial_delay is not None else config.LLM_RETRY_BASE_DELAY
     if not client:
         current_key = os.environ.get("GEMINI_API_KEY")
         if current_key:
@@ -67,10 +75,13 @@ async def generate_with_retry(prompt: str, retries: int = 5, initial_delay: floa
         for attempt in range(retries):
             try:
                 async with SEM:
-                    response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=prompt
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.models.generate_content,
+                            model=model_name,
+                            contents=prompt,
+                        ),
+                        timeout=config.LLM_TIMEOUT,
                     )
                 text = _extract_response_text(response)
                 if text:
@@ -795,6 +806,10 @@ async def generate_tests_batch(functions: List[Dict[str, Any]], source_code: str
     if not functions:
         return "# No testable functions found"
 
+    if config.LLM_MOCK:
+        await asyncio.sleep(config.LLM_MOCK_LATENCY)
+        return _mock_test_code(functions, source_file)
+
     is_js = source_file.endswith(('.js', '.ts', '.jsx', '.tsx'))
     source_basename = os.path.basename(source_file)
     source_module = os.path.splitext(source_basename)[0]
@@ -986,6 +1001,17 @@ async def refactor_batch(functions: List[Dict[str, Any]]) -> List[Dict[str, Any]
     if not functions:
         return []
 
+    if config.LLM_MOCK:
+        await asyncio.sleep(config.LLM_MOCK_LATENCY)
+        return [
+            {
+                "name": f.get("display_name") or f.get("name", "unknown"),
+                "refactored_code": f.get("body", ""),
+                "breaking_changes": [],
+            }
+            for f in functions
+        ]
+
     func_data = []
     for f in functions:
         body = f.get("body", "").strip()[:400]
@@ -1054,40 +1080,218 @@ Return your response in this EXACT JSON format (no markdown fences):
         return [{"name": f.get("display_name") or f.get("name", "unknown"), "refactored_code": f.get("body", ""), "breaking_changes": []} for f in functions]
 
 
-async def process_all_functions(functions: List[Dict[str, Any]], task: str) -> List[Any]:
-    """Process all functions concurrently for a given task."""
-    if task == "explain":
-        tasks = [explain_function(f) for f in functions]
-    elif task == "tests":
-        tasks = [generate_tests(f) for f in functions]
-    elif task == "refactor":
-        tasks = [refactor_function(f) for f in functions]
-    else:
-        raise ValueError(f"Unknown task: {task}")
+# ==========================================================================
+# Progressive / batched AI analysis.
+#
+# The pipeline sends MANY functions per request and asks for strict JSON keyed
+# by a stable ``function_id``, so results map back to functions without fragile
+# name matching. This is what turns N per-function calls into N/batch_size
+# bounded-concurrency calls.
+# ==========================================================================
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+def _mock_test_code(functions: List[Dict[str, Any]], source_file: str = "") -> str:
+    """Deterministic, offline placeholder tests used only when LLM_MOCK is on."""
+    is_js = source_file.endswith((".js", ".ts", ".jsx", ".tsx"))
+    names = [f.get("name", "func") for f in functions]
+    if is_js:
+        lines = ["const test = require('node:test');", "const assert = require('node:assert');", ""]
+        for name in names:
+            lines.append(f"test('{name} (mock)', () => {{ assert.ok(true); }});")
+        return "\n".join(lines)
+    lines = ["import unittest", "", "", "class MockGeneratedTests(unittest.TestCase):"]
+    for name in names:
+        lines.append(f"    def test_{name}_mock(self):")
+        lines.append("        self.assertTrue(True)")
+    lines.append("")
+    lines.append("")
+    lines.append("if __name__ == '__main__':")
+    lines.append("    unittest.main()")
+    return "\n".join(lines)
 
-    processed = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            func_name = functions[i].get("display_name") or functions[i].get("name", "unknown")
-            if task == "explain":
-                processed.append({
-                    "name": func_name,
-                    "raw_name": functions[i].get("name", "unknown"),
-                    "class_name": functions[i].get("class_name"),
-                    "filename": functions[i].get("filename", ""),
-                    "explanation": f"Error: {str(result)}"
-                })
-            elif task == "tests":
-                processed.append(f"# Error: {str(result)}")
-            elif task == "refactor":
-                processed.append({
-                    "name": func_name,
-                    "refactored_code": f"# Error: {str(result)}",
-                    "breaking_changes": []
-                })
+
+def _strip_code_fences(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("```json"):
+        t = t[7:]
+    elif t.startswith("```"):
+        t = t[3:]
+    if t.endswith("```"):
+        t = t[:-3]
+    return t.strip()
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Best-effort tolerant JSON extraction from an LLM response."""
+    if not text:
+        return None
+    cleaned = _strip_code_fences(text)
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for idx in range(start, len(cleaned)):
+        ch = cleaned[idx]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(cleaned[start:idx + 1])
+                    return data if isinstance(data, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def normalize_explanation_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce a model-produced explanation object into the frontend contract."""
+    return {
+        "name": _coerce_text(item.get("name", "")),
+        "explanation": _coerce_text(item.get("explanation", "")),
+        "usage": _coerce_text(item.get("usage", "")),
+        "purpose": _coerce_text(item.get("purpose", "")),
+        "input_output": _coerce_text(item.get("input_output") or item.get("inputOutput", "")),
+        "risks": _coerce_text(item.get("risks", "")),
+    }
+
+
+def _mock_explanation(payload: Dict[str, Any]) -> Dict[str, Any]:
+    name = payload.get("name") or payload.get("function_id", "function")
+    params = payload.get("parameters") or []
+    called = payload.get("called_functions") or []
+    out = payload.get("returns")
+    return {
+        "function_id": payload.get("function_id"),
+        "name": name,
+        "explanation": f"{name} handles {name} behaviour for the module.",
+        "usage": f"{name}({', '.join(p for p in params if p not in ('self', 'cls'))})  # exercises the routine",
+        "purpose": f"Exists to provide {name} so the module can complete its workflow reliably.",
+        "input_output": f"Parameters: {', '.join(params) if params else 'none'}; returns {out or 'a computed result'}.",
+        "risks": (
+            f"Calls {', '.join(called)} without guarding against failure, so an exception propagates to the caller."
+            if called
+            else f"Accesses {name} state directly with no validation or error handling around it."
+        ),
+    }
+
+
+def _build_batch_prompt(payloads: List[Dict[str, Any]], strict: bool = False) -> str:
+    entries = []
+    for p in payloads:
+        params = ", ".join(p.get("parameters") or []) or "no parameters"
+        called = ", ".join(p.get("called_functions") or []) or "none"
+        lang = p.get("language", "python")
+        fence = "python" if lang == "python" else "javascript"
+        entries.append(
+            f"function_id: {p.get('function_id')}\n"
+            f"Name: {p.get('name')}\n"
+            f"Class: {p.get('class_name') or 'none'}\n"
+            f"Parameters: {params}\n"
+            f"Calls: {called}\n"
+            f"Source:\n```{fence}\n{p.get('source', '')}\n```"
+        )
+    func_list = "\n\n---\n\n".join(entries)
+
+    instructions = CONTRASTIVE_EXPLANATION_GUIDE
+    if strict:
+        instructions += (
+            "\n\nSTRICT MODE: your previous answer was not valid JSON or failed validation. "
+            "Respond with ONLY the JSON object - no prose, no markdown fences, no trailing text. "
+            "Every field must be a non-empty string grounded in that function's own source code."
+        )
+
+    return f"""You are a principal software engineer documenting legacy code.
+
+{instructions}
+
+Analyze EACH of the following functions independently. Each entry carries a stable
+`function_id` - echo it back EXACTLY as given.
+
+{func_list}
+
+Respond ONLY with valid JSON (no markdown fences) in this exact shape:
+{{
+  "results": [
+    {{
+      "function_id": "<echo the id exactly>",
+      "name": "...",
+      "explanation": "...",
+      "usage": "...",
+      "purpose": "...",
+      "input_output": "...",
+      "risks": "..."
+    }}
+  ]
+}}
+Return exactly one object per input function, in the same order."""
+
+
+async def analyze_functions_batch(functions: List[Any], strict: bool = False) -> Dict[str, Any]:
+    """Explain many functions in ONE request, returning strict JSON.
+
+    ``functions`` may be role="RegisteredFunction" instances or plain dicts that
+    already carry the ``to_llm_dict`` shape. Returns ``{"results": [...]}`` where
+    each result carries the originating ``function_id``. Raises on transport or
+    JSON failure so the caller can retry / fall back.
+    """
+    payloads = []
+    for func in functions or []:
+        if hasattr(func, "to_llm_dict"):
+            payloads.append(func.to_llm_dict())
         else:
-            processed.append(result)
+            payloads.append(func)
+    if not payloads:
+        return {"results": []}
 
-    return processed
+    if config.LLM_MOCK:
+        await asyncio.sleep(config.LLM_MOCK_LATENCY)
+        return {"results": [_mock_explanation(p) for p in payloads]}
+
+    prompt = _build_batch_prompt(payloads, strict=strict)
+    text = await generate_with_retry(prompt)
+    data = _extract_json_object(text)
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise ValueError("LLM response was not valid JSON with a 'results' array")
+
+    allowed_ids = {p.get("function_id") for p in payloads}
+    cleaned: List[Dict[str, Any]] = []
+    for item in data.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        fid = item.get("function_id")
+        if fid not in allowed_ids:
+            continue
+        entry = normalize_explanation_item(item)
+        entry["function_id"] = fid
+        cleaned.append(entry)
+
+    # Some models omit or mangle ids: if the count matches, map by order.
+    if len(cleaned) != len(payloads):
+        cleaned = []
+        raw_items = [i for i in data.get("results", []) if isinstance(i, dict)]
+        for payload, item in zip(payloads, raw_items):
+            entry = normalize_explanation_item(item)
+            entry["function_id"] = payload.get("function_id")
+            cleaned.append(entry)
+
+    return {"results": cleaned}

@@ -5,12 +5,103 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CodeOracle - AI-Powered Legacy Code Analyzer</title>
     <meta name="description" content="CodeOracle — AI-powered analysis for legacy Python & JavaScript codebases. Get explanations, tests, refactoring suggestions, and dependency graphs.">
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('co-theme');
+                if (t !== 'light' && t !== 'dark') {
+                    t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+                }
+            } catch (e) {
+                t = 'dark';
+            }
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-    <script>window.mermaid || document.write('<script src="https://unpkg.com/mermaid/dist/mermaid.min.js"><\/script>');</script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>window.tailwind || document.write('<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4/dist/index.global.js"><\/script>');</script>
+    <script>
+        if (window.tailwind) window.tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        fg: 'rgb(var(--c-fg) / <alpha-value>)',
+                        gray: {
+                            200: 'rgb(var(--gray-200) / <alpha-value>)',
+                            300: 'rgb(var(--gray-300) / <alpha-value>)',
+                            400: 'rgb(var(--gray-400) / <alpha-value>)',
+                            500: 'rgb(var(--gray-500) / <alpha-value>)',
+                            600: 'rgb(var(--gray-600) / <alpha-value>)',
+                            700: 'rgb(var(--gray-700) / <alpha-value>)',
+                            750: 'rgb(var(--gray-750) / <alpha-value>)',
+                            800: 'rgb(var(--gray-800) / <alpha-value>)',
+                            900: 'rgb(var(--gray-900) / <alpha-value>)',
+                            950: 'rgb(var(--gray-950) / <alpha-value>)'
+                        },
+                        blue: {
+                            200: 'rgb(var(--blue-200) / <alpha-value>)',
+                            300: 'rgb(var(--blue-300) / <alpha-value>)',
+                            400: 'rgb(var(--blue-400) / <alpha-value>)',
+                            500: 'rgb(var(--blue-500) / <alpha-value>)',
+                            600: 'rgb(var(--blue-600) / <alpha-value>)',
+                            700: 'rgb(var(--blue-700) / <alpha-value>)',
+                            950: 'rgb(var(--blue-950) / <alpha-value>)'
+                        },
+                        emerald: {
+                            300: 'rgb(var(--emerald-300) / <alpha-value>)',
+                            400: 'rgb(var(--emerald-400) / <alpha-value>)',
+                            500: 'rgb(var(--emerald-500) / <alpha-value>)',
+                            600: 'rgb(var(--emerald-600) / <alpha-value>)',
+                            700: 'rgb(var(--emerald-700) / <alpha-value>)',
+                            800: 'rgb(var(--emerald-800) / <alpha-value>)',
+                            950: 'rgb(var(--emerald-950) / <alpha-value>)'
+                        },
+                        amber: {
+                            200: 'rgb(var(--amber-200) / <alpha-value>)',
+                            300: 'rgb(var(--amber-300) / <alpha-value>)',
+                            400: 'rgb(var(--amber-400) / <alpha-value>)',
+                            500: 'rgb(var(--amber-500) / <alpha-value>)',
+                            700: 'rgb(var(--amber-700) / <alpha-value>)',
+                            800: 'rgb(var(--amber-800) / <alpha-value>)',
+                            950: 'rgb(var(--amber-950) / <alpha-value>)'
+                        },
+                        red: {
+                            400: 'rgb(var(--red-400) / <alpha-value>)',
+                            500: 'rgb(var(--red-500) / <alpha-value>)',
+                            600: 'rgb(var(--red-600) / <alpha-value>)',
+                            700: 'rgb(var(--red-700) / <alpha-value>)',
+                            800: 'rgb(var(--red-800) / <alpha-value>)',
+                            950: 'rgb(var(--red-950) / <alpha-value>)'
+                        },
+                        rose: {
+                            300: 'rgb(var(--rose-300) / <alpha-value>)',
+                            400: 'rgb(var(--rose-400) / <alpha-value>)',
+                            500: 'rgb(var(--rose-500) / <alpha-value>)',
+                            600: 'rgb(var(--rose-600) / <alpha-value>)',
+                            700: 'rgb(var(--rose-700) / <alpha-value>)',
+                            950: 'rgb(var(--rose-950) / <alpha-value>)'
+                        },
+                        green: {
+                            400: 'rgb(var(--green-400) / <alpha-value>)',
+                            500: 'rgb(var(--green-500) / <alpha-value>)'
+                        },
+                        purple: {
+                            400: 'rgb(var(--purple-400) / <alpha-value>)',
+                            500: 'rgb(var(--purple-500) / <alpha-value>)'
+                        },
+                        cyan: {
+                            400: 'rgb(var(--cyan-400) / <alpha-value>)'
+                        },
+                        indigo: {
+                            500: 'rgb(var(--indigo-500) / <alpha-value>)'
+                        }
+                    }
+                }
+            }
+        };
+    </script>
 </head>
 <body>
     <div id="root"></div>

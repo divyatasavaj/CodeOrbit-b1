@@ -113,13 +113,22 @@ def _parse_coverage_json(test_dir: str, source_file: str) -> Dict[str, Any]:
                 ) if result["lines_total"] > 0 else 0
 
                 analysis = file_data.get("analysis", [])
-                for line_data in analysis:
-                    line_no = line_data[0]
-                    coverage_count = line_data[1]
-                    if coverage_count is None:
-                        result["missing_lines"].append(line_no)
-                    else:
-                        result["covered_lines"].append(line_no)
+                if analysis:
+                    for line_data in analysis:
+                        line_no = line_data[0]
+                        coverage_count = line_data[1]
+                        if coverage_count is None:
+                            result["missing_lines"].append(line_no)
+                        else:
+                            result["covered_lines"].append(line_no)
+                else:
+                    # Newer coverage.py JSON reports: executed_lines/missing_lines lists
+                    result["covered_lines"] = [
+                        ln for ln in (file_data.get("executed_lines") or []) if isinstance(ln, int)
+                    ]
+                    result["missing_lines"] = [
+                        ln for ln in (file_data.get("missing_lines") or []) if isinstance(ln, int)
+                    ]
 
                 result["file_coverage"][file_path] = {
                     "summary": summary,

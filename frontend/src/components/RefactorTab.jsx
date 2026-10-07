@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
+import FunctionPicker from "./FunctionPicker.jsx";
+import { API } from "../api.js";
 
 async function copyToClipboard(text) {
     if (!text) return false;
@@ -52,7 +54,7 @@ function CopyButton({ text }) {
                     ? "bg-emerald-950/90 border-emerald-500 text-emerald-300"
                     : copyFailed
                     ? "bg-rose-950/90 border-rose-500 text-rose-300"
-                    : "bg-gray-800 hover:bg-gray-700 border-gray-700 text-gray-300 hover:text-white"
+                    : "bg-gray-800 hover:bg-gray-700 border-gray-700 text-gray-300 hover:text-fg"
             }`}
         >
             {copied ? <span>Copied!</span> : copyFailed ? <span>Copy Failed</span> : <span>Copy Code</span>}
@@ -60,7 +62,56 @@ function CopyButton({ text }) {
     );
 }
 
-export default function RefactorTab({ refactor }) {
+export default function RefactorTab({ refactor = [], explanation, jobId, onUpdate }) {
+    const [generating, setGenerating] = useState(null); // function name in flight
+    const [genError, setGenError] = useState("");
+    const [pickerOpen, setPickerOpen] = useState(false);
+
+    const list = Array.isArray(refactor) ? refactor : [];
+    const generatedNames = useMemo(() => new Set(list.map(r => r.name)), [list]);
+
+    const handleGenerate = async (functionName, filename) => {
+        if (!jobId) {
+            setGenError("Analysis job ID is missing — please run a new analysis.");
+            return;
+        }
+        setGenerating(functionName);
+        setGenError("");
+        try {
+            const res = await fetch(`${API}/generate/refactor/${jobId}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ function_name: functionName, filename })
+            });
+            if (!res.ok) {
+                let detail = `HTTP ${res.status}`;
+                try { detail = (await res.json()).detail || detail; } catch (e) {}
+                throw new Error(detail);
+            }
+            const entry = await res.json();
+            if (onUpdate) {
+                onUpdate(prev => ({
+                    ...prev,
+                    refactor: [...(prev.refactor || []).filter(r => r.name !== entry.name), entry]
+                }));
+            }
+        } catch (err) {
+            setGenError(err.message || "Refactoring failed. Please try again.");
+        } finally {
+            setGenerating(null);
+        }
+    };
+
+    const errorBanner = genError ? (
+        <div className="flex items-start gap-2.5 bg-rose-950/60 border border-rose-800/80 rounded-xl px-4 py-3 text-sm text-rose-300">
+            <svg className="w-4 h-4 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="flex-1">{genError}</span>
+            <button type="button" onClick={() => setGenError("")} className="text-rose-400 hover:text-rose-200 font-bold leading-none" title="Dismiss">✕</button>
+        </div>
+    ) : null;
+
     const getRiskColor = (risk) => {
         switch (risk?.toLowerCase()) {
             case "high": return "bg-rose-950 border border-rose-700 text-rose-300 font-semibold";
@@ -70,9 +121,64 @@ export default function RefactorTab({ refactor }) {
         }
     };
 
+    // Empty state — on-demand picker (refactoring is generated per function)
+    if (list.length === 0) {
+        return (
+            <div className="space-y-4">
+                {errorBanner}
+                <FunctionPicker
+                    explanation={explanation}
+                    existingNames={generatedNames}
+                    generatingName={generating}
+                    generateLabel="Generate"
+                    title="Generate Refactored Code On Demand"
+                    description="The initial analysis skips refactoring to save time. Pick any function below to get its modernized version with breaking-change analysis (one AI call per function, a few seconds)."
+                    onGenerate={handleGenerate}
+                />
+            </div>
+        );
+    }
+
     return (
         <div className="space-y-6">
-            {refactor.map((item, i) => (
+            {errorBanner}
+
+            {/* On-demand generation: refactor another function */}
+            {pickerOpen ? (
+                <div className="space-y-2">
+                    <FunctionPicker
+                        explanation={explanation}
+                        existingNames={generatedNames}
+                        generatingName={generating}
+                        generateLabel="Generate"
+                        title="Generate Refactored Code For Another Function"
+                        description="One AI call per function. The result appears in the list below when it finishes."
+                        onGenerate={handleGenerate}
+                    />
+                    <div className="flex justify-end">
+                        <button
+                            type="button"
+                            onClick={() => setPickerOpen(false)}
+                            className="text-xs text-gray-400 hover:text-fg px-3 py-1.5 rounded-lg border border-gray-700 hover:border-gray-500 transition-colors cursor-pointer"
+                        >
+                            Hide Picker
+                        </button>
+                    </div>
+                </div>
+            ) : (
+                <button
+                    type="button"
+                    onClick={() => setPickerOpen(true)}
+                    className="w-full py-3 rounded-xl border border-dashed border-gray-700 hover:border-blue-500/60 hover:bg-blue-500/5 text-sm text-gray-400 hover:text-blue-300 font-medium transition-all duration-150 cursor-pointer flex items-center justify-center gap-2"
+                >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    Generate refactored code for another function
+                </button>
+            )}
+
+            {list.map((item, i) => (
                 <div key={i} className="bg-gray-800 rounded-xl p-6">
                     <div className="flex items-center justify-between mb-4">
                         <span className="font-mono text-green-400 font-medium text-lg">{item.name}()</span>
@@ -128,9 +234,6 @@ export default function RefactorTab({ refactor }) {
                     )}
                 </div>
             ))}
-            {(!refactor || refactor.length === 0) && (
-                <p className="text-gray-500 text-center py-10">No refactoring data available</p>
-            )}
         </div>
     );
 }
