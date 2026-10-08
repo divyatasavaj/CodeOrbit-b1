@@ -1,9 +1,11 @@
 import os
 import asyncio
+import contextvars
 import difflib
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
@@ -11,6 +13,7 @@ from google import genai
 
 import config
 import function_registry as registry_mod
+from llm_provider import get_llm_provider
 
 logger = logging.getLogger("codeoracle")
 
@@ -30,6 +33,50 @@ FALLBACK_MODELS = list(dict.fromkeys([config.MODEL, "gemini-3.5-flash"]))
 # Global LLM concurrency limit shared by every call site (explanations, tests,
 # refactors, all jobs) so one large repository cannot monopolise the API.
 SEM = asyncio.Semaphore(config.LLM_CONCURRENCY)
+
+# Interactive, user-triggered calls (on-demand "Generate test / refactor") get
+# their own lane and take priority over bulk analysis, so a click is never
+# queued behind hundreds of background batches.
+INTERACTIVE_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "codeoracle_interactive", default=False
+)
+INTERACTIVE_SEM = asyncio.Semaphore(max(1, int(os.environ.get(
+    "CODEORACLE_LLM_INTERACTIVE_CONCURRENCY", "2"))))
+_interactive_inflight = 0
+_interactive_idle: Optional[asyncio.Event] = None
+
+
+def mark_interactive() -> None:
+    """Mark the current task (and children) as user-triggered, high priority."""
+    INTERACTIVE_CTX.set(True)
+
+
+def _interactive_event() -> asyncio.Event:
+    global _interactive_idle
+    if _interactive_idle is None:
+        _interactive_idle = asyncio.Event()
+        _interactive_idle.set()
+    return _interactive_idle
+
+
+@asynccontextmanager
+async def _interactive_lane():
+    global _interactive_inflight
+    _interactive_inflight += 1
+    _interactive_event().clear()
+    try:
+        async with INTERACTIVE_SEM:
+            yield
+    finally:
+        _interactive_inflight -= 1
+        if _interactive_inflight <= 0:
+            _interactive_event().set()
+
+
+async def _yield_to_interactive() -> None:
+    """Bulk work waits while a user-triggered request is in flight."""
+    if _interactive_inflight > 0:
+        await _interactive_event().wait()
 
 # Quick-results mode: generate full LLM explanations for this fraction of each
 # module's functions, then stop and fall back to the grounded AST engine for the
@@ -58,8 +105,13 @@ def _extract_response_text(response: Any) -> str:
     return ""
 
 
-async def generate_with_retry(prompt: str, retries: Optional[int] = None, initial_delay: Optional[float] = None) -> str:
-    """Execute Gemini generate_content with Semaphore, fallback models, and exponential backoff retry."""
+async def _gemini_generate(prompt: str, retries: Optional[int] = None,
+                           initial_delay: Optional[float] = None) -> str:
+    """Direct Gemini generate_content with Semaphore, fallback models and backoff.
+
+    Used when the provider router has no provider configured and as the final
+    fallback after a router failure, so a Gemini-only setup keeps working.
+    """
     global client
     retries = retries if retries is not None else config.LLM_MAX_RETRIES + 1
     initial_delay = initial_delay if initial_delay is not None else config.LLM_RETRY_BASE_DELAY
@@ -68,7 +120,9 @@ async def generate_with_retry(prompt: str, retries: Optional[int] = None, initia
         if current_key:
             client = genai.Client(api_key=current_key)
         else:
-            raise ValueError("GEMINI_API_KEY environment variable is not set")
+            raise ValueError(
+                "No LLM provider configured: set GROQ_API_KEY (preferred) or GEMINI_API_KEY"
+            )
 
     last_error = None
     for model_name in FALLBACK_MODELS:
@@ -104,6 +158,63 @@ async def generate_with_retry(prompt: str, retries: Optional[int] = None, initia
                         break
 
     raise last_error or Exception("Failed to generate content after retries")
+
+
+async def _router_generate(prompt: str) -> str:
+    """Generate via the provider router: Groq primary, Gemini fallback."""
+    router = get_llm_provider()
+    if not router.primary_provider:
+        raise ValueError(
+            "No LLM provider configured: set GROQ_API_KEY (preferred) or GEMINI_API_KEY"
+        )
+    if INTERACTIVE_CTX.get():
+        # User-triggered: jump ahead of bulk analysis.
+        async with _interactive_lane():
+            return await router.generate(prompt)
+    # Bulk: let any in-flight interactive request finish first.
+    await _yield_to_interactive()
+    async with SEM:
+        await _yield_to_interactive()
+        return await router.generate(prompt)
+
+
+async def generate_with_retry(prompt: str, retries: Optional[int] = None,
+                              initial_delay: Optional[float] = None) -> str:
+    """Generate text through the configured provider.
+
+    Primary path is the provider router (Groq primary, Gemini fallback), chosen
+    by ``LLM_PROVIDER`` and which API keys are present. If the router has no
+    provider at all we fall back to the direct Gemini client so a Gemini-only
+    setup is unaffected.
+    """
+    retries = retries if retries is not None else config.LLM_MAX_RETRIES + 1
+    initial_delay = initial_delay if initial_delay is not None else config.LLM_RETRY_BASE_DELAY
+
+    router_error = None
+    primary = None
+    try:
+        primary = get_llm_provider().primary_provider
+    except Exception as exc:  # noqa: BLE001 - router init is best effort
+        router_error = exc
+
+    if primary:
+        for attempt in range(retries):
+            try:
+                return await _router_generate(prompt)
+            except Exception as exc:  # noqa: BLE001 - retry, then fall back
+                router_error = exc
+                if attempt < retries - 1:
+                    await asyncio.sleep(initial_delay * (2 ** attempt))
+        logger.warning(
+            "LLM router (%s) failed after %d attempts: %s", primary.name, retries, router_error
+        )
+
+    try:
+        return await _gemini_generate(prompt, retries, initial_delay)
+    except Exception:
+        if router_error is not None:
+            raise router_error
+        raise
 
 
 BANNED_PHRASES = [

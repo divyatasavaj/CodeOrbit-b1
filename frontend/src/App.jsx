@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import ExplanationTab from "./components/ExplanationTab.jsx";
 import GraphTab from "./components/GraphTab.jsx";
 import TestsTab from "./components/TestsTab.jsx";

@@ -27,6 +27,42 @@ MAX_LLM_RETRIES = int(os.environ.get("MAX_LLM_RETRIES", "2"))
 MAX_CONCURRENT_LLM_REQUESTS = int(os.environ.get("MAX_CONCURRENT_LLM_REQUESTS", "2"))
 LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "0.3"))
 LLM_RETRY_MAX_DELAY = float(os.environ.get("LLM_RETRY_MAX_DELAY", "2.0"))
+# Rate-limit (429) retries are counted separately and wait for the window the
+# provider tells us to wait for, instead of the short transient backoff.
+GROQ_429_MAX_RETRIES = int(os.environ.get("GROQ_429_MAX_RETRIES", "6"))
+GROQ_429_MAX_WAIT = float(os.environ.get("GROQ_429_MAX_WAIT", "90.0"))
+
+
+def _parse_duration_seconds(value: str) -> float:
+    """Parse provider duration strings such as '43.822s', '1m2.5s' or '500ms'."""
+    if not value:
+        return 0.0
+    value = value.strip()
+    try:
+        if value.endswith("ms"):
+            return float(value[:-2]) / 1000.0
+        if "m" in value:
+            minutes, _, seconds = value.partition("m")
+            seconds = seconds.rstrip("s") or "0"
+            return float(minutes) * 60 + float(seconds)
+        if value.endswith("s"):
+            value = value[:-1]
+        return float(value)
+    except ValueError:
+        return 0.0
+
+
+def _groq_retry_after(resp) -> float:
+    """Seconds to wait before retrying a Groq 429, from its rate-limit headers."""
+    headers = resp.headers
+    wait = _parse_duration_seconds(headers.get("retry-after") or headers.get("Retry-After"))
+    if wait <= 0:
+        wait = _parse_duration_seconds(headers.get("x-ratelimit-reset-tokens", ""))
+    if wait <= 0:
+        wait = _parse_duration_seconds(headers.get("x-ratelimit-reset-requests", ""))
+    if wait <= 0:
+        wait = 5.0
+    return min(max(wait, 1.0), GROQ_429_MAX_WAIT)
 
 class QuotaExhaustedError(Exception):
     """Raised when API quota is exhausted (daily limit)."""
@@ -120,8 +156,10 @@ class GroqProvider(LLMProvider):
             raise ValueError("Groq client not initialized. Check GROQ_API_KEY.")
         model_name = model or self.default_model
         request_start = time.time()
-        
-        for attempt in range(MAX_LLM_RETRIES + 1):
+
+        attempt = 0
+        rate_limit_attempts = 0
+        while attempt <= MAX_LLM_RETRIES:
             try:
                 resp = await self._client.post(
                     self.GROQ_API_URL,
@@ -137,27 +175,28 @@ class GroqProvider(LLMProvider):
                     return text
                 
                 if resp.status_code == 429:
-                    retry_after = 0
-                    ra_header = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-                    if ra_header:
-                        try:
-                            retry_after = float(ra_header)
-                        except ValueError:
-                            pass
-                    if attempt < MAX_LLM_RETRIES:
-                        base_delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
-                        jitter = random.uniform(0, 0.3)
-                        delay = min(base_delay + jitter, LLM_RETRY_MAX_DELAY)
-                        await asyncio.sleep(delay)
+                    retry_after = _groq_retry_after(resp)
+                    if rate_limit_attempts < GROQ_429_MAX_RETRIES:
+                        rate_limit_attempts += 1
+                        jitter = random.uniform(0, 0.5)
+                        wait = min(retry_after + jitter, GROQ_429_MAX_WAIT)
+                        logger.warning(
+                            "Groq rate limited (429); waiting %.1fs then retrying (%d/%d)",
+                            wait, rate_limit_attempts, GROQ_429_MAX_RETRIES,
+                        )
+                        await asyncio.sleep(wait)
                         continue
-                    else:
-                        raise RateLimitError("groq", retry_after, f"429 after {MAX_LLM_RETRIES} retries")
+                    raise RateLimitError(
+                        "groq", retry_after,
+                        f"429 after {rate_limit_attempts} rate-limit retries",
+                    )
                 
                 if resp.status_code in (503, 502):
                     if attempt < MAX_LLM_RETRIES:
                         base_delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
                         delay = min(base_delay, 3.0)
                         await asyncio.sleep(delay)
+                        attempt += 1
                         continue
                 
                 raise Exception(f"Groq API error {resp.status_code}: {resp.text[:500]}")
@@ -165,9 +204,12 @@ class GroqProvider(LLMProvider):
             except httpx.TimeoutException:
                 if attempt < MAX_LLM_RETRIES:
                     await asyncio.sleep(LLM_RETRY_BASE_DELAY * (2 ** attempt))
+                    attempt += 1
                     continue
                 raise
-            
+
+            attempt += 1
+
         raise Exception("Groq: max retries exceeded")
 
 class GeminiProvider(LLMProvider):

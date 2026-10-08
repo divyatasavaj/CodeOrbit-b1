@@ -38,3 +38,4 @@ backend/.env
 .vercel
 backend/uvicorn*.log
 frontend/*.log
+backend/*.log
