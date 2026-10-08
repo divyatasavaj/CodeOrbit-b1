@@ -5,6 +5,11 @@ import TestsTab from "./components/TestsTab.jsx";
 import RefactorTab from "./components/RefactorTab.jsx";
 import { API } from "./api.js";
 
+/* Pagination window for GET /jobs/{id}/functions (spec sections 2, 18). */
+const PAGE_SIZE = 100;
+const REFRESH_PAGE_LIMIT = 500;
+const AI_DONE_STATUSES = ["ai", "cached", "trivial_skipped", "ast_fallback"];
+
 export default function App() {
     const [view, setView] = useState("upload");
     const [theme, setTheme] = useState(() => document.documentElement.getAttribute("data-theme") || "dark");
@@ -20,12 +25,27 @@ export default function App() {
     const [analysisProgress, setAnalysisProgress] = useState(null);
     const [structural, setStructural] = useState(null);
     const [aiStatus, setAiStatus] = useState(null);
+    // Paginated function window: {groups, total, loaded, offset, query, hasMore, loading, loadingMore}
+    const [fnWindow, setFnWindow] = useState(null);
+    // Per-file AI completion counters: {filename: {done, total}} - tiny, incremental.
+    const [fileProgress, setFileProgress] = useState(null);
     const pollingRef = useRef(null);
     const eventSourceRef = useRef(null);
+    const doneIdsRef = useRef(new Set());
+    const windowQueryRef = useRef("");
+    const fnWindowRef = useRef(null);
 
-    const handleCancel = () => {
+    const resetJobState = () => {
         if (pollingRef.current) clearInterval(pollingRef.current);
         if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; }
+        doneIdsRef.current = new Set();
+        windowQueryRef.current = "";
+        setFnWindow(null);
+        setFileProgress(null);
+    };
+
+    const handleCancel = () => {
+        resetJobState();
         // Ask the backend to stop scheduling further LLM batches.
         if (jobId) {
             fetch(`${API}/jobs/${jobId}/cancel`, { method: "POST" }).catch(() => {});
@@ -51,46 +71,221 @@ export default function App() {
         setTheme(next);
     };
 
+    /* ---------------- lightweight data helpers (never /results) -------------- */
+    const fetchStatus = useCallback(async (id) => {
+        const res = await fetch(`${API}/jobs/${id}/status`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+    }, []);
+
+    const fetchWindow = useCallback(async (id, query = "", offset = 0, limit = PAGE_SIZE) => {
+        const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+        if (query) params.set("search", query);
+        const res = await fetch(`${API}/jobs/${id}/functions?${params.toString()}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+    }, []);
+
+    const applyStatus = useCallback((id, st) => {
+        setResults(st);
+        setJobId(id);
+        setStructural(st.structural || null);
+        setAnalysisProgress(st.analysis_progress || null);
+        setAiStatus(st.ai_status || null);
+        const counts = st.file_counts || {};
+        setFileProgress(prev => prev || (
+            Object.keys(counts).length
+                ? Object.fromEntries(Object.entries(counts).map(([k, v]) => [k, { done: 0, total: v }]))
+                : {}
+        ));
+    }, []);
+
+    /* Merge function-shaped objects into the window by function_id, preserving
+       identity for untouched entries so memoized rows never re-render
+       (spec sections 7, 8 and 10). */
+    const mergeFnsIntoWindow = (prev, fns) => {
+        if (!prev || !Array.isArray(prev.groups) || !fns || !fns.length) return prev;
+        const map = new Map();
+        fns.forEach(f => { if (f && f.function_id) map.set(f.function_id, f); });
+        if (!map.size) return prev;
+        let changed = false;
+        const groups = prev.groups.map(g => {
+            let gChanged = false;
+            const functions = (g.functions || []).map(f => {
+                const rep = map.get(f.function_id);
+                if (!rep) return f;
+                if (rep.ai_status === f.ai_status && rep.explanation === f.explanation && rep.name === f.name) return f;
+                gChanged = true;
+                return {
+                    name: rep.name !== undefined && rep.name !== null ? rep.name : f.name,
+                    function_id: f.function_id,
+                    ai_status: rep.ai_status,
+                    explanation: rep.explanation !== undefined ? rep.explanation : f.explanation,
+                };
+            });
+            if (!gChanged) return g;
+            changed = true;
+            return { ...g, functions };
+        });
+        return changed ? { ...prev, groups } : prev;
+    };
+
+    /* One SSE batch: targeted window merge + tiny per-file counters. */
+    const applyBatchEntries = useCallback((entries) => {
+        setFnWindow(prev => mergeFnsIntoWindow(prev, entries));
+
+        const deltas = {};
+        for (const e of entries) {
+            if (!e || !e.function_id) continue;
+            if (AI_DONE_STATUSES.includes(e.ai_status) && !doneIdsRef.current.has(e.function_id)) {
+                doneIdsRef.current.add(e.function_id);
+                const f = e.filename || "unknown";
+                deltas[f] = (deltas[f] || 0) + 1;
+            }
+        }
+        if (Object.keys(deltas).length > 0) {
+            setFileProgress(prev => {
+                if (!prev) return prev;
+                let changed = false;
+                const next = { ...prev };
+                for (const [f, d] of Object.entries(deltas)) {
+                    const cur = next[f] || { done: 0, total: 0 };
+                    next[f] = { done: cur.done + d, total: cur.total };
+                    changed = true;
+                }
+                return changed ? next : prev;
+            });
+        }
+    }, []);
+
+    const loadWindowPage = useCallback((id, query, offset, limit, mode) => {
+        return fetchWindow(id, query, offset, limit).then(page => {
+            if (query !== windowQueryRef.current) return; // stale search response
+            if (mode === "reset") {
+                setFnWindow({
+                    groups: page.groups || [],
+                    total: page.total || 0,
+                    loaded: page.loaded || 0,
+                    offset: 0,
+                    query,
+                    hasMore: (page.total || 0) > (page.loaded || 0),
+                    loading: false,
+                    loadingMore: false,
+                });
+            } else if (mode === "append") {
+                setFnWindow(prev => {
+                    if (!prev) return prev;
+                    const byName = new Map(prev.groups.map(g => [g.filename, g]));
+                    const groups = [...prev.groups];
+                    (page.groups || []).forEach(g => {
+                        const existing = byName.get(g.filename);
+                        if (existing) {
+                            const idx = groups.indexOf(existing);
+                            const seen = new Set((existing.functions || []).map(f => f.function_id));
+                            const add = (g.functions || []).filter(f => !seen.has(f.function_id));
+                            if (add.length) groups[idx] = { ...existing, functions: [...existing.functions, ...add] };
+                        } else {
+                            groups.push(g);
+                            byName.set(g.filename, g);
+                        }
+                    });
+                    const loaded = groups.reduce((a, g) => a + ((g.functions || []).length), 0);
+                    return {
+                        ...prev, groups, loaded,
+                        total: page.total != null ? page.total : prev.total,
+                        hasMore: loaded < (page.total != null ? page.total : loaded),
+                        loadingMore: false,
+                    };
+                });
+            } else if (mode === "refresh") {
+                // Replace loaded entries with fresh statuses (fallback polling /
+                // finalize) without dropping anything beyond the fetched page.
+                setFnWindow(prev => {
+                    if (!prev) return prev;
+                    const fns = [];
+                    (page.groups || []).forEach(g => (g.functions || []).forEach(f => fns.push(f)));
+                    const merged = mergeFnsIntoWindow(prev, fns);
+                    return merged ? { ...merged, loading: false, loadingMore: false } : merged;
+                });
+            }
+        });
+    }, [fetchWindow]);
+
+    const handleWindowSearch = useCallback((query) => {
+        const id = jobId;
+        if (!id) return;
+        windowQueryRef.current = query;
+        setFnWindow(prev => (prev ? { ...prev, loading: true } : prev));
+        loadWindowPage(id, query, 0, PAGE_SIZE, "reset").catch(() => {
+            setFnWindow(prev => (prev ? { ...prev, loading: false } : prev));
+        });
+    }, [jobId, loadWindowPage]);
+
+    const loadMoreWindow = useCallback(() => {
+        const id = jobId;
+        const prev = fnWindowRef.current;
+        if (!id || !prev || prev.loadingMore || !prev.hasMore) return;
+        const offset = prev.loaded;
+        setFnWindow(p => (p ? { ...p, loadingMore: true } : p));
+        loadWindowPage(id, windowQueryRef.current, offset, PAGE_SIZE, "append").catch(() => {});
+    }, [jobId, loadWindowPage]);
+
+    /* Refresh the currently loaded window slice (finalize + SSE-less fallback). */
+    const refreshWindow = useCallback((id) => {
+        const prev = fnWindowRef.current;
+        if (!prev) return;
+        const limit = Math.min(Math.max(prev.loaded, PAGE_SIZE), REFRESH_PAGE_LIMIT);
+        loadWindowPage(id, windowQueryRef.current, 0, limit, "refresh").catch(() => {});
+    }, [loadWindowPage]);
+
     const startPollingFallback = useCallback((id) => {
         if (pollingRef.current) clearInterval(pollingRef.current);
         let failedPolls = 0;
+        let shellLoaded = false;
         pollingRef.current = setInterval(async () => {
             try {
-                const res = await fetch(`${API}/results/${id}`);
-                if (!res.ok) {
-                    if (res.status === 404) throw new Error("job-not-found");
-                    throw new Error(`HTTP ${res.status}`);
-                }
-                const data = await res.json();
+                const st = await fetchStatus(id);
                 failedPolls = 0;
 
-                if (data.status === "error") {
+                if (st.status === "error") {
                     clearInterval(pollingRef.current);
-                    setError(data.message || "Analysis failed");
+                    setError(st.message || "Analysis failed");
                     setLoading(false);
                     setView("upload");
                     return;
                 }
 
-                if (data.structural_ready || data.status === "complete") {
-                    // Structural analysis is ready - show real results while AI
-                    // explanations continue to arrive on the next polls.
-                    setResults(data);
-                    setJobId(id);
-                    setStructural(data.structural || null);
-                    setAnalysisProgress(data.analysis_progress || null);
-                    setAiStatus(data.ai_status || null);
-                    setDiscovery(null);
-                    setLoading(false);
-                    setView("results");
+                applyStatus(id, st);
+
+                if (st.structural_ready) {
+                    if (!shellLoaded) {
+                        shellLoaded = true;
+                        const page = await fetchWindow(id, windowQueryRef.current, 0, PAGE_SIZE);
+                        setFnWindow({
+                            groups: page.groups || [],
+                            total: page.total || 0,
+                            loaded: page.loaded || 0,
+                            offset: 0,
+                            query: windowQueryRef.current,
+                            hasMore: (page.total || 0) > (page.loaded || 0),
+                            loading: false,
+                            loadingMore: false,
+                        });
+                        setDiscovery(null);
+                        setLoading(false);
+                        setView("results");
+                    } else {
+                        // Status-only refresh (no SSE): keep window entries current.
+                        refreshWindow(id);
+                    }
                 } else {
-                    setProgress(data.progress || "Processing...");
-                    if (data.functions_found !== undefined || data.files_found !== undefined) {
-                        setDiscovery({ functions: data.functions_found, files: data.files_found });
+                    setProgress(st.progress || "Processing...");
+                    if (st.functions_found !== undefined || st.files_found !== undefined) {
+                        setDiscovery({ functions: st.functions_found, files: st.files_found });
                     }
                 }
 
-                if (data.status === "complete") clearInterval(pollingRef.current);
+                if (st.status === "complete" || st.status === "cancelled") clearInterval(pollingRef.current);
             } catch (err) {
                 if (failedPolls >= 5) {
                     clearInterval(pollingRef.current);
@@ -101,76 +296,53 @@ export default function App() {
                     failedPolls += 1;
                 }
             }
-        }, 2000);
-    }, []);
-
-    const mergeExplanationEntries = useCallback((entries) => {
-        if (!Array.isArray(entries) || entries.length === 0) return;
-        setResults(prev => {
-            if (!prev) return prev;
-            const groups = Array.isArray(prev.explanation) ? [...prev.explanation] : [];
-            const byFile = {};
-            const order = [];
-            groups.forEach(g => {
-                const fname = g.filename || "unknown";
-                byFile[fname] = { ...g, functions: [...(g.functions || [])] };
-                order.push(fname);
-            });
-            entries.forEach(entry => {
-                const fname = entry.filename || "unknown";
-                if (!byFile[fname]) {
-                    byFile[fname] = { filename: fname, module_summary: `Module ${fname}`, functions: [] };
-                    order.push(fname);
-                }
-                const funcs = byFile[fname].functions.filter(f => f.name !== entry.name);
-                funcs.push({
-                    name: entry.name,
-                    function_id: entry.function_id,
-                    ai_status: entry.ai_status,
-                    explanation: entry.explanation
-                });
-                funcs.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-                byFile[fname].functions = funcs;
-            });
-            return { ...prev, explanation: order.map(f => byFile[f]) };
-        });
-    }, []);
+        }, 2500);
+    }, [fetchStatus, fetchWindow, applyStatus, refreshWindow]);
 
     const openAnalysisStream = useCallback((id) => {
         if (pollingRef.current) clearInterval(pollingRef.current);
         if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; }
+        // Fresh job: drop any previous window/counters so nothing leaks across jobs.
+        doneIdsRef.current = new Set();
+        windowQueryRef.current = "";
+        setFnWindow(null);
+        setFileProgress(null);
 
-        const finalize = async () => {
-            try {
-                const res = await fetch(`${API}/results/${id}`);
-                const data = await res.json();
-                setResults(data);
-                setJobId(id);
-                setStructural(data.structural || null);
-                setAnalysisProgress(data.analysis_progress || null);
-                setAiStatus(data.ai_status || null);
-                setDiscovery(null);
-                setView("results");
-            } catch (e) { /* keep whatever we already have */ }
-            setLoading(false);
-            setDiscovery(null);
-        };
-
+        /* Status shell + first functions page - NEVER the full /results payload
+           (multi-megabyte on large repositories, spec sections 2 and 9). */
         const loadStructural = async () => {
             try {
-                const res = await fetch(`${API}/results/${id}`);
-                const data = await res.json();
-                setResults(data);
-                setJobId(id);
-                setStructural(data.structural || null);
-                setAnalysisProgress(data.analysis_progress || null);
-                setAiStatus(data.ai_status || null);
+                const st = await fetchStatus(id);
+                applyStatus(id, st);
+                const page = await fetchWindow(id, "", 0, PAGE_SIZE);
+                setFnWindow({
+                    groups: page.groups || [],
+                    total: page.total || 0,
+                    loaded: page.loaded || 0,
+                    offset: 0,
+                    query: "",
+                    hasMore: (page.total || 0) > (page.loaded || 0),
+                    loading: false,
+                    loadingMore: false,
+                });
                 setDiscovery(null);
                 setLoading(false);
                 setView("results");
             } catch (e) {
                 startPollingFallback(id);
             }
+        };
+
+        const finalize = async () => {
+            try {
+                const st = await fetchStatus(id);
+                applyStatus(id, st);
+                refreshWindow(id);
+                setDiscovery(null);
+                setView("results");
+            } catch (e) { /* keep whatever we already have */ }
+            setLoading(false);
+            setDiscovery(null);
         };
 
         try {
@@ -187,7 +359,7 @@ export default function App() {
                     setAiStatus("ai_generating");
                     setAnalysisProgress({ completed: ev.cached || 0, total: ev.total, failed: 0, cached: ev.cached, trivial: ev.trivial });
                 } else if (type === "batch_completed") {
-                    if (ev.functions && ev.functions.length) mergeExplanationEntries(ev.functions);
+                    if (ev.functions && ev.functions.length) applyBatchEntries(ev.functions);
                     setAnalysisProgress({ completed: ev.completed, total: ev.total, failed: ev.failed, cached: ev.cached, trivial: ev.trivial });
                     setAiStatus("ai_partial");
                 } else if (type === "progress") {
@@ -201,16 +373,15 @@ export default function App() {
                     es.close();
                     eventSourceRef.current = null;
                     try {
-                        const res = await fetch(`${API}/results/${id}`);
-                        const data = await res.json();
-                        if (data.status === "error") {
-                            setError(data.message || "Analysis failed");
+                        const st = await fetchStatus(id);
+                        if (st.status === "error") {
+                            setError(st.message || "Analysis failed");
                             setLoading(false);
                             setView("upload");
                             return;
                         }
-                        setResults(data);
-                        setJobId(id);
+                        applyStatus(id, st);
+                        if (st.structural_ready && !fnWindowRef.current) await loadStructural();
                         setView("results");
                     } catch (e) { /* ignore */ }
                     setLoading(false);
@@ -228,7 +399,11 @@ export default function App() {
         } catch (e) {
             startPollingFallback(id);
         }
-    }, [mergeExplanationEntries, startPollingFallback]);
+    }, [applyBatchEntries, fetchStatus, fetchWindow, applyStatus, refreshWindow, startPollingFallback]);
+
+    useEffect(() => {
+        fnWindowRef.current = fnWindow;
+    }, [fnWindow]);
 
     useEffect(() => {
         // Wake the Render backend (free tier sleeps after ~15 min of inactivity)
@@ -289,7 +464,6 @@ export default function App() {
 
     // Backend error codes -> the exact user-facing copy.
     const GITHUB_ERROR_MESSAGES = {
-        invalid_github_url: "Please enter a valid GitHub repository URL.",
         invalid_github_url: "Please enter a valid GitHub repository URL.",
         github_not_found: "Repository not found.\n\nPlease check that:\n\u2022 The URL is correct\n\u2022 The repository is public\n\u2022 The repository still exists",
         github_private: "This repository is private.\nCodeOracle currently supports public GitHub repositories only.",
@@ -405,7 +579,7 @@ export default function App() {
                         </button>
                         {view === "results" ? (
                             <button
-                                onClick={() => { setView("upload"); setResults(null); setJobId(null); setError(null); setActiveTab("explanation"); }}
+                                onClick={() => { resetJobState(); setView("upload"); setResults(null); setJobId(null); setError(null); setActiveTab("explanation"); }}
                                 className="co-btn-signup"
                             >
                                 New Analysis
@@ -481,6 +655,10 @@ export default function App() {
                         structural={structural}
                         aiStatus={aiStatus}
                         onCancel={handleCancel}
+                        fnWindow={fnWindow}
+                        fileProgress={fileProgress}
+                        onSearch={handleWindowSearch}
+                        onLoadMore={loadMoreWindow}
                     />
                 )}
             </main>
@@ -552,7 +730,7 @@ function ProcessingScreen({ progress, discovery, onCancel, analysisProgress }) {
             </div>
 
             <h2 className="text-2xl font-bold text-fg mb-2 tracking-tight">
-                {pct !== null ? "Generating AI explanations" : "Analyzing codebase structure"}
+                {pct !== null ? "Generating AI explanations" : "Analyzing Codebase structure"}
             </h2>
 
             <div className="bg-gray-800/80 border border-gray-700/80 rounded-xl px-5 py-3 mb-4 w-full shadow-lg backdrop-blur-sm">
@@ -887,9 +1065,7 @@ function UploadScreen({ onUpload, onAnalysis, selectedFile, setSelectedFile, onD
         </div>
     );
 }
-const AI_DONE_STATUSES = ["ai", "cached", "trivial_skipped", "ast_fallback"];
-
-function AiProgressPanel({ progress, structural, aiStatus, explanation, onCancel }) {
+const AiProgressPanel = React.memo(function AiProgressPanel({ progress, structural, aiStatus, fileProgress, onCancel }) {
     if (!progress || !progress.total) return null;
 
     const total = progress.total || 0;
@@ -903,13 +1079,13 @@ function AiProgressPanel({ progress, structural, aiStatus, explanation, onCancel
     if (finished && (aiStatus === "ai_complete" || aiStatus === "ai_disabled")) return null;
 
     const counts = (structural && structural.file_function_counts) || {};
-    const groups = Array.isArray(explanation) ? explanation : [];
-    const files = groups.map(g => {
-        const funcs = g.functions || [];
-        const aiDone = funcs.filter(f => AI_DONE_STATUSES.includes(f.ai_status)).length;
-        const expected = counts[g.filename] || funcs.length;
-        return { name: g.filename || "unknown", done: aiDone, total: expected };
-    });
+    // Incremental per-file counters maintained by SSE batches (spec sections 9,
+    // 21 and 22) - no scans over the full function list on every render.
+    const files = Object.keys(fileProgress || {}).map(name => ({
+        name,
+        done: (fileProgress[name] && fileProgress[name].done) || 0,
+        total: (fileProgress[name] && fileProgress[name].total) || counts[name] || 0,
+    }));
     const pending = files.filter(f => f.done < f.total);
     const visible = pending.length ? pending : files;
     const shown = visible.slice(0, 8);
@@ -968,16 +1144,16 @@ function AiProgressPanel({ progress, structural, aiStatus, explanation, onCancel
             )}
         </div>
     );
-}
+});
 
-function ResultsView({ results, activeTab, setActiveTab, tabs, jobId, onResultsUpdate, analysisProgress, structural, aiStatus, onCancel }) {
+function ResultsView({ results, activeTab, setActiveTab, tabs, jobId, onResultsUpdate, analysisProgress, structural, aiStatus, onCancel, fnWindow, fileProgress, onSearch, onLoadMore }) {
     return (
         <div className="space-y-6">
             <AiProgressPanel
                 progress={analysisProgress || results.analysis_progress}
                 structural={structural || results.structural}
                 aiStatus={aiStatus || results.ai_status}
-                explanation={results.explanation}
+                fileProgress={fileProgress}
                 onCancel={onCancel}
             />
 
@@ -1034,16 +1210,25 @@ function ResultsView({ results, activeTab, setActiveTab, tabs, jobId, onResultsU
             </div>
 
             {activeTab === "explanation" && (
-                <ExplanationTab explanation={results.explanation} />
+                <ExplanationTab
+                    jobId={jobId}
+                    groups={fnWindow ? fnWindow.groups : null}
+                    total={fnWindow ? fnWindow.total : null}
+                    totalAll={results.summary ? (results.summary.functions_found || null) : null}
+                    loadingMore={fnWindow ? !!fnWindow.loadingMore : false}
+                    hasMore={fnWindow ? !!fnWindow.hasMore : false}
+                    isLoading={fnWindow ? !!fnWindow.loading : true}
+                    onSearch={onSearch}
+                    onLoadMore={onLoadMore}
+                />
             )}
             {activeTab === "graph" && (
-                <GraphTab graph={results.graph} isLoading={!results.graph} />
+                <GraphTab graph={results.graph || null} isLoading={false} jobId={jobId} />
             )}
             {activeTab === "tests" && (
                 <TestsTab
                     tests={results.tests}
                     isLoading={!results.tests}
-                    explanation={results.explanation}
                     jobId={jobId}
                     onUpdate={onResultsUpdate}
                 />
@@ -1051,7 +1236,6 @@ function ResultsView({ results, activeTab, setActiveTab, tabs, jobId, onResultsU
             {activeTab === "refactor" && (
                 <RefactorTab
                     refactor={results.refactor || []}
-                    explanation={results.explanation}
                     jobId={jobId}
                     onUpdate={onResultsUpdate}
                 />

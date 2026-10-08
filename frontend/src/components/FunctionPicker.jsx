@@ -1,11 +1,17 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
+import { API } from "../api.js";
 
 /**
- * Shared on-demand generation picker: searchable, file-grouped function list
- * built from the job's explanation payload.
+ * Shared on-demand generation picker: searchable, file-grouped function list.
+ *
+ * When `jobId` is provided the picker fetches metadata-only pages from
+ * `/jobs/{id}/functions?include_explanation=0` (debounced, spec sections 9,
+ * 10 and 26) so large repositories never ship their full function payload to
+ * the client. Falls back to the legacy `explanation` prop otherwise.
  *
  * @param {Object} props
- * @param {Array<Object>} props.explanation - file groups [{filename, functions:[{name}]}]
+ * @param {Array<Object>} [props.explanation] - file groups [{filename, functions:[{name}]}]
+ * @param {string|null} [props.jobId] - job id for server-side metadata fetch
  * @param {Set<string>} props.existingNames - display names already generated
  * @param {string|null} props.generatingName - function currently being generated
  * @param {string} props.generateLabel - button label ("Generate" / "Regenerate")
@@ -15,6 +21,7 @@ import { useState, useMemo } from "react";
  */
 export default function FunctionPicker({
     explanation,
+    jobId = null,
     existingNames,
     generatingName = null,
     generateLabel = "Generate",
@@ -23,8 +30,40 @@ export default function FunctionPicker({
     onGenerate
 }) {
     const [query, setQuery] = useState("");
+    const [serverGroups, setServerGroups] = useState(null);
+    const [serverTotal, setServerTotal] = useState(0);
+    const debounceRef = useRef(null);
+    const seqRef = useRef(0);
+
+    useEffect(() => {
+        if (!jobId) return undefined;
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => {
+            const q = query.trim();
+            const seq = ++seqRef.current;
+            fetch(`${API}/jobs/${jobId}/functions?offset=0&limit=500&include_explanation=0&search=${encodeURIComponent(q)}`)
+                .then(res => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+                .then(data => {
+                    if (seq !== seqRef.current) return; // stale response
+                    setServerGroups(Array.isArray(data.groups) ? data.groups : []);
+                    setServerTotal(data.total || 0);
+                })
+                .catch(() => {
+                    /* keep previous list on failure */
+                });
+        }, 250);
+        return () => clearTimeout(debounceRef.current);
+    }, [jobId, query]);
 
     const groups = useMemo(() => {
+        if (jobId && serverGroups) {
+            return serverGroups
+                .map(grp => ({
+                    filename: grp.filename || "unknown",
+                    functions: grp.functions || [],
+                }))
+                .filter(grp => grp.functions.length > 0);
+        }
         if (!Array.isArray(explanation) || explanation.length === 0) return [];
         let normalized = explanation;
         if (explanation[0]?.filename === undefined || explanation[0]?.functions === undefined) {
@@ -41,7 +80,10 @@ export default function FunctionPicker({
                 })
             }))
             .filter(grp => grp.functions.length > 0);
-    }, [explanation, query]);
+    }, [jobId, serverGroups, explanation, query]);
+
+    const loadedCount = groups.reduce((acc, g) => acc + g.functions.length, 0);
+    const truncated = jobId && serverTotal > loadedCount;
 
     const busy = generatingName !== null;
 
@@ -106,7 +148,7 @@ export default function FunctionPicker({
                                                     <>
                                                         <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
                                                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 0 011.898-5.23A8.002 8.002 0 0110 4a8 8 0 018 8 8.002 8.002 0 01-1.23 4.002A8 8 0 0112 20h-1.85a8 8 0 01-6.158-3.768L4 12z"></path>
                                                         </svg>
                                                         Generating…
                                                     </>
@@ -125,9 +167,16 @@ export default function FunctionPicker({
                 ))}
                 {groups.length === 0 && (
                     <p className="text-gray-500 text-sm text-center py-4">
-                        {Array.isArray(explanation) && explanation.length > 0
+                        {query.trim().length > 0
                             ? `No functions match "${query}".`
+                            : jobId && serverGroups === null
+                            ? "Loading function list..."
                             : "No function list is available for this analysis."}
+                    </p>
+                )}
+                {truncated && (
+                    <p className="text-[11px] text-gray-500 text-center py-1">
+                        Showing {loadedCount} of {serverTotal} functions - search to narrow the list.
                     </p>
                 )}
             </div>

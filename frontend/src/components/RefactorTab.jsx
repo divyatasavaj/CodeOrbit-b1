@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import React, { useState, useMemo } from "react";
 import FunctionPicker from "./FunctionPicker.jsx";
 import { API } from "../api.js";
 
@@ -62,7 +62,7 @@ function CopyButton({ text }) {
     );
 }
 
-export default function RefactorTab({ refactor = [], explanation, jobId, onUpdate }) {
+function RefactorTab({ refactor = [], explanation, jobId, onUpdate }) {
     const [generating, setGenerating] = useState(null); // function name in flight
     const [genError, setGenError] = useState("");
     const [pickerOpen, setPickerOpen] = useState(false);
@@ -133,6 +133,7 @@ export default function RefactorTab({ refactor = [], explanation, jobId, onUpdat
                     generateLabel="Generate"
                     title="Generate Refactored Code On Demand"
                     description="The initial analysis skips refactoring to save time. Pick any function below to get its modernized version with breaking-change analysis (one AI call per function, a few seconds)."
+                    jobId={jobId}
                     onGenerate={handleGenerate}
                 />
             </div>
@@ -153,6 +154,7 @@ export default function RefactorTab({ refactor = [], explanation, jobId, onUpdat
                         generateLabel="Generate"
                         title="Generate Refactored Code For Another Function"
                         description="One AI call per function. The result appears in the list below when it finishes."
+                        jobId={jobId}
                         onGenerate={handleGenerate}
                     />
                     <div className="flex justify-end">
@@ -237,3 +239,5 @@ export default function RefactorTab({ refactor = [], explanation, jobId, onUpdat
         </div>
     );
 }
+
+export default React.memo(RefactorTab);

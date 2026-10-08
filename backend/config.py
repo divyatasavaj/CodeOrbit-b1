@@ -55,6 +55,14 @@ LLM_RETRY_BASE_DELAY = max(0.0, _float("LLM_RETRY_BASE_DELAY", 0.5))
 LLM_MOCK = _bool("CODEORACLE_LLM_MOCK", False)
 LLM_MOCK_LATENCY = max(0.0, _float("CODEORACLE_LLM_MOCK_LATENCY", 1.0))
 
+# Per-function context ceilings for LLM prompts (spec sections 5, 7 and 35).
+# A whole repository / file is never sent to the model: oversized function
+# sources are truncated and the dependency list is capped so one huge
+# function cannot blow up a batch prompt or stall generation.
+MAX_FUNCTION_CONTEXT_LINES = max(50, _int("CODEORACLE_MAX_FUNCTION_CONTEXT_LINES", 300))
+MAX_CONTEXT_CHARS = max(2000, _int("CODEORACLE_MAX_CONTEXT_CHARS", 20000))
+MAX_DEPENDENCY_CONTEXT = max(1, _int("CODEORACLE_MAX_DEPENDENCY_CONTEXT", 5))
+
 # AI analysis toggle and priority floor (low|medium|high).
 AI_ANALYSIS_ENABLED = _bool("CODEORACLE_AI_ENABLED", True)
 AI_MIN_PRIORITY = os.environ.get("CODEORACLE_AI_MIN_PRIORITY", "low").strip().lower()
@@ -106,3 +114,27 @@ JS_EXTENSIONS = {".js", ".ts", ".jsx", ".tsx"}
 # Progress persistence throttling: how many completed functions between
 # lightweight metadata flushes to the filesystem job store.
 PROGRESS_FLUSH_EVERY = max(1, _int("CODEORACLE_PROGRESS_FLUSH_EVERY", 16))
+
+# ---------------------------------------------------------------------------
+# Test generation / coverage quality gate
+# ---------------------------------------------------------------------------
+# Minimum *measured* line coverage a generated per-function test suite must
+# reach before it is treated as a successful result. The value always comes
+# from a real pytest/node execution of the coverage tool - it is never
+# synthesized, rounded up, or hardcoded anywhere in the pipeline.
+MIN_TEST_COVERAGE = min(100.0, max(0.0, _float("CODEORACLE_MIN_TEST_COVERAGE", 65.0)))
+# Total generation attempts allowed per suite (initial generation + improvement
+# rounds) before the loop returns its best measured result. The spec-style
+# CODEORACLE_TEST_MAX_ATTEMPTS (total attempts, default 3) takes precedence;
+# the legacy improvement-rounds variable is still honoured when it is unset.
+_TOTAL_ATTEMPTS = _int("CODEORACLE_TEST_MAX_ATTEMPTS", 0)
+if _TOTAL_ATTEMPTS <= 0:
+    _TOTAL_ATTEMPTS = 1 + max(0, _int("CODEORACLE_MAX_TEST_IMPROVEMENT_ATTEMPTS", 2))
+TEST_MAX_ATTEMPTS = max(1, _TOTAL_ATTEMPTS)
+# Extra "improve the tests, then re-run and re-measure" rounds after the first.
+MAX_TEST_IMPROVEMENT_ATTEMPTS = TEST_MAX_ATTEMPTS - 1
+# Cache-key component: a suite generated under a different coverage target or
+# attempt budget must never be reused as if it satisfied the current one.
+TESTS_CACHE_VERSION = (
+    f"{PROMPT_VERSION_TESTS}:mc{int(MIN_TEST_COVERAGE)}:at{TEST_MAX_ATTEMPTS}"
+)

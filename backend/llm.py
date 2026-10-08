@@ -835,7 +835,10 @@ const assert = require('node:assert');
 const src = require('./{source_basename}');
 2. Test ALL listed functions with meaningful assertions (normal cases, edge cases, error cases).
 3. Call functions as `src.funcName(...)` or destructured imported functions.
-4. Return ONLY valid runnable JavaScript code. No markdown fences."""
+4. COVERAGE TARGET: the measured line coverage of this suite must be at least {config.MIN_TEST_COVERAGE:g}%.
+   - Exercise normal execution, boundary conditions, invalid inputs, important branches, and error paths.
+   - Every test must assert real expected behavior - never add no-assert calls that exist only to inflate coverage.
+5. Return ONLY valid runnable JavaScript code. No markdown fences."""
     else:
         prompt = f"""Generate comprehensive pytest unit tests for the following functions from a Python module.
 
@@ -858,6 +861,9 @@ CRITICAL REQUIREMENTS:
 8. Use pytest fixtures where appropriate
 9. Handle global state safely by patching if needed
 10. Each test function must have a unique name (use test_<function_name>_<scenario>)
+11. COVERAGE TARGET: the measured line coverage of this suite must be at least {config.MIN_TEST_COVERAGE:g}% - the backend runs the real coverage tool against these tests.
+12. Cover normal execution, boundary conditions, invalid inputs, important branches, exception paths, and edge cases.
+13. Assert real expected values and states - never write no-assert tests that exist only to inflate coverage.
 
 Return ONLY the Python test code. No explanation. No markdown fences.
 The test file should be complete and runnable with `pytest`."""
@@ -870,6 +876,159 @@ The test file should be complete and runnable with `pytest`."""
         if test_code.endswith("```"):
             test_code = test_code[:-3].strip()
         return test_code
+    except Exception as e:
+        return f"# Error generating tests: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Per-function generation with complete context (spec sections 8-13, 29)
+# ---------------------------------------------------------------------------
+# ``ctx`` is built by main.build_test_context(): the COMPLETE function source,
+# the containing class, real file imports, and the detected framework. The
+# target function's text is never truncated (only irrelevant sibling code is
+# omitted), so the model never has to speculate.
+
+def _fence_strip(test_code: str) -> str:
+    t = (test_code or "").strip()
+    for fence in ("```javascript", "```typescript", "```ts", "```js", "```python", "```"):
+        if t.startswith(fence):
+            t = t[len(fence):].strip()
+    if t.endswith("```"):
+        t = t[:-3].strip()
+    return t
+
+
+def _fence_lang_for(ctx: Dict[str, Any]) -> str:
+    ext = ctx.get("source_ext") or ""
+    if ext in (".ts", ".tsx"):
+        return "typescript"
+    if ext in (".jsx", ".tsx"):
+        return "javascript"
+    if ctx.get("is_js"):
+        return "javascript"
+    return "python"
+
+
+def _environment_block(ctx: Dict[str, Any]) -> str:
+    """Explain how the suite will REALLY be executed (spec sections 11-13)."""
+    fw = ctx.get("framework") or {}
+    if ctx.get("is_js"):
+        module_system = fw.get("moduleSystem") or "cjs"
+        runner = fw.get("testRunner") or "node:test"
+        declared_cmd = fw.get("testCommand") or runner
+        lang = fw.get("language") or _fence_lang_for(ctx)
+        mod_line = ("ESM - use import/export statements" if module_system == "esm"
+                    else "CommonJS - use require()")
+        return (
+            "TEST ENVIRONMENT (detected from this repository's own config files):\n"
+            f"- Language: {lang}\n"
+            f"- The repository declares: {runner} (test command: {declared_cmd})\n"
+            "- Execution: CodeOracle runs the suite with Node's built-in runner "
+            "(`node --test` + `node:assert`) because node_modules is NOT part of "
+            "the uploaded repository - write node:test style tests even when the "
+            "repo declares jest/vitest/mocha.\n"
+            f"- Module system: {mod_line}\n"
+            f"- Import the module under test EXACTLY as shown here: {ctx.get('import_example', '')}"
+        )
+    runner = fw.get("testRunner") or "pytest"
+    return (
+        "TEST ENVIRONMENT (detected from this repository's own config files):\n"
+        f"- Test framework: {runner} - CodeOracle executes the suite and measures "
+        "real coverage; a percentage is never estimated or assumed.\n"
+        f"- Import the module under test EXACTLY as shown here: {ctx.get('import_example', '')}"
+    )
+
+
+def _requirements_block(ctx: Dict[str, Any]) -> str:
+    """Shared hard rules for every generation (spec sections 7, 13, 17, 40)."""
+    target = ctx.get("target", config.MIN_TEST_COVERAGE)
+    name = (ctx.get("func") or {}).get("name") or "the_target_function"
+    rules = [
+        f"Every test must actually CALL `{name}` - a suite that never invokes "
+        "the target function is rejected (coverage of 0 is always reported honestly).",
+        "Assert REAL expected values derived from the source logic - never "
+        "`assert True`, typeof-only checks, or other placeholders that pass "
+        "without exercising behavior.",
+        "Cover EVERY branch of the function: normal path, boundary values, "
+        "and validation/error paths - configure mocks PER BRANCH so each test "
+        "drives a different path through the code.",
+        "Mock only what the implementation actually imports (network, "
+        "filesystem, database, framework glue). Pure logic must run for real.",
+    ]
+    if ctx.get("class_source"):
+        rules.append(
+            "Construct class instances the way the module allows (plain "
+            "constructor with mock dependencies, or Class.__new__(Class) for "
+            "Python) - never skip instantiation."
+        )
+    rules.append(
+        f"COVERAGE TARGET: measured coverage of `{name}`'s own lines must be at "
+        f"least {target:g}% - the backend runs the real coverage tool and feeds "
+        "any uncovered lines back to you."
+    )
+    rules.append(
+        "Do not modify repository source files, make network calls, or rely on "
+        "environment state outside this file."
+    )
+    rules.append("Return ONLY the complete runnable test code - no prose, no markdown fences.")
+    return "\n".join(f"{i}. {text}" for i, text in enumerate(rules, 1))
+
+
+def _function_block(ctx: Dict[str, Any]) -> str:
+    """Complete function/class source + the file's real imports (never truncated)."""
+    func = ctx.get("func") or {}
+    lang = _fence_lang_for(ctx)
+    disp = func.get("display_name") or func.get("name") or "target"
+    parts = [
+        f"COMPLETE source of the target function `{disp}` (full text - never "
+        f"speculate about hidden lines):\n```{lang}\n{ctx.get('function_source') or func.get('body', '')}\n```"
+    ]
+    if ctx.get("class_source"):
+        cls = func.get("class_name") or "the containing class"
+        parts.append(
+            f"Containing class `{cls}` (constructor, DI fields, sibling methods):\n"
+            f"```{lang}\n{ctx['class_source']}\n```"
+        )
+    if ctx.get("import_lines"):
+        parts.append(
+            "The module's real imports (use these when deciding what to mock):\n"
+            + "\n".join(ctx["import_lines"])
+        )
+    return "\n\n".join(parts)
+
+
+async def generate_function_tests(ctx: Dict[str, Any]) -> str:
+    """Generate a test suite for ONE function from a complete pre-built context.
+
+    The context carries the untruncated function source, class context, real
+    imports and the detected framework - replacing the old batch prompt that
+    truncated the whole file at 4000 chars (spec sections 8-10).
+    """
+    func = ctx.get("func") or {}
+    source_file = ctx.get("source_file", "")
+    if config.LLM_MOCK:
+        await asyncio.sleep(config.LLM_MOCK_LATENCY)
+        return _mock_test_code([func], source_file)
+
+    disp = func.get("display_name") or func.get("name") or "the function"
+    if ctx.get("is_js"):
+        prompt = (
+            f"Generate a complete Node.js test suite for the function `{disp}`.\n\n"
+            f"{_environment_block(ctx)}\n\n"
+            f"{_function_block(ctx)}\n\n"
+            "REQUIREMENTS:\n" + _requirements_block(ctx)
+        )
+    else:
+        prompt = (
+            f"Generate a complete pytest test suite for `{disp}`.\n\n"
+            f"{_environment_block(ctx)}\n\n"
+            f"{_function_block(ctx)}\n\n"
+            "REQUIREMENTS:\n" + _requirements_block(ctx)
+        )
+
+    try:
+        test_code = await generate_with_retry(prompt)
+        return _fence_strip(test_code)
     except Exception as e:
         return f"# Error generating tests: {str(e)}"
 
@@ -908,32 +1067,95 @@ Function:
         return f"# Error generating tests: {str(e)}"
 
 
-async def generate_tests_for_coverage(func: Dict[str, Any], uncovered_lines: str) -> str:
-    """Generate improved tests targeting uncovered lines."""
+async def generate_tests_for_coverage(
+    func: Dict[str, Any],
+    uncovered_lines: str,
+    source_file: str = "",
+    ctx: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Generate an *improved* test suite that targets the currently uncovered paths.
+
+    Used by the minimum-coverage loop: the backend measures real coverage, and
+    when it lands below the target it feeds the uncovered lines (plus failure
+    diagnosis) back to the LLM and re-runs the tests. Returns a COMPLETE
+    replacement suite (previous cases must be kept) so the caller can simply
+    overwrite the test file. When ``ctx`` (from main.build_test_context) is
+    provided the prompt carries the complete function/class source, the file's
+    real imports and the detected framework (spec sections 15, 29, 31).
+    """
     body = func.get('body', '').strip()
     if not body:
         body = f"def {func.get('name', 'func')}():\n    pass"
 
-    prompt = f"""Generate pytest unit tests for this function, focusing on covering these uncovered lines/branches:
+    if config.LLM_MOCK:
+        await asyncio.sleep(config.LLM_MOCK_LATENCY)
+        return _mock_test_code([func], source_file)
 
-Uncovered areas: {uncovered_lines}
+    is_js = (source_file or "").endswith(('.js', '.ts', '.jsx', '.tsx'))
+    func_name = func.get("name", "func")
+    args = ", ".join(func.get("args", []) or [])
+    source_basename = os.path.basename(source_file) if source_file else ""
+    source_module = os.path.splitext(source_basename)[0]
 
-Function:
+    if ctx:
+        disp = func.get("display_name") or func_name
+        opener = (
+            f"The existing test suite for `{disp}` does not reach the coverage "
+            "target and/or fails its run.\n\n"
+            "DIAGNOSIS - real measured results from the previous run "
+            "(fix exactly what it reports):\n"
+            f"{uncovered_lines}\n"
+        )
+        closer = (
+            "\nWrite a COMPLETE REPLACEMENT test file:\n"
+            "1. Keep every test that already passed - do not drop working cases.\n"
+            "2. ADD tests that execute the specific uncovered lines/branches listed "
+            "in the diagnosis above.\n"
+            "3. If the diagnosis reports a failure category (wrong import, missing "
+            "mock, failing assertion, broken discovery), fix that root cause first.\n"
+            "\nREQUIREMENTS:\n" + _requirements_block(ctx)
+        )
+        prompt = opener + "\n" + _environment_block(ctx) + "\n\n" + _function_block(ctx) + closer
+    elif is_js:
+        prompt = f"""The existing unit tests for `{func_name}` do not execute enough of its code.
+
+Uncovered areas (from a real coverage report):
+{uncovered_lines}
+
+Function under test:
+```javascript
+{body}
+```
+
+Write an IMPROVED Node.js test suite (`node:test` + `node:assert`) that is a COMPLETE replacement file:
+1. Keep every test that already worked - do not drop existing passing cases.
+2. ADD tests that specifically execute the uncovered lines and branches listed above.
+3. Import the module with: const src = require('./{source_basename}');
+4. Cover both normal and edge/error paths so the function's lines are genuinely executed.
+5. Return ONLY runnable JavaScript code. No explanation. No markdown fences."""
+    else:
+        prompt = f"""The existing pytest suite for `{func_name}({args})` does not execute enough of its code lines.
+
+Uncovered areas (from a real coverage report):
+{uncovered_lines}
+
+Function under test:
 ```python
 {body}
 ```
 
-Include tests that specifically target the uncovered paths. Return ONLY Python test code. No explanation. No markdown fences."""
+Write an IMPROVED pytest suite that is a COMPLETE replacement test file:
+1. Keep every test that already worked - do not drop existing passing cases.
+2. ADD tests that specifically execute the uncovered lines and branches listed above.
+3. Import the source module with: import {source_module}
+4. Exercise the real branches of `{func_name}` (normal cases, boundaries, error paths) so those lines actually run.
+5. Each test function must have a unique name (use test_{func_name}_<scenario>).
+
+Return ONLY the Python test code. No explanation. No markdown fences."""
 
     try:
         test_code = await generate_with_retry(prompt)
-        if test_code.startswith("```python"):
-            test_code = test_code[len("```python"):].strip()
-        elif test_code.startswith("```"):
-            test_code = test_code[3:].strip()
-        if test_code.endswith("```"):
-            test_code = test_code[:-3].strip()
-        return test_code
+        return _fence_strip(test_code)
     except Exception as e:
         return f"# Error generating coverage tests: {str(e)}"
 
@@ -1089,23 +1311,95 @@ Return your response in this EXACT JSON format (no markdown fences):
 # bounded-concurrency calls.
 # ==========================================================================
 
+_MOCK_STRING_HINTS = (
+    "name", "text", "msg", "message", "label", "title", "key", "path",
+    "filename", "reason", "currency", "desc", "status",
+)
+_MOCK_SEQ_HINTS = (
+    "items", "lst", "list", "arr", "array", "values", "rows", "entries",
+    "records", "args", "kwargs",
+)
+_MOCK_INT_HINTS = (
+    "count", "qty", "quantity", "num", "number", "size", "index", "idx",
+    "stock", "age", "limit", "length", "total", "n", "i",
+)
+_MOCK_FLOAT_HINTS = (
+    "price", "amount", "rate", "ratio", "score", "weight", "value",
+    "percent", "discount", "tax",
+)
+
+
+def _mock_dummy(param: str, is_js: bool = False) -> str:
+    """Harmless literal for a synthesized mock-suite argument."""
+    name = (param or "").lower()
+    if any(hint in name for hint in _MOCK_SEQ_HINTS):
+        return "[]" if is_js else "[]"
+    if name in ("mapping", "options", "config", "params", "data"):
+        return "{}"
+    if any(hint in name for hint in _MOCK_STRING_HINTS):
+        return '"value"'
+    if any(hint in name for hint in _MOCK_FLOAT_HINTS):
+        return "1.0"
+    if any(hint in name for hint in _MOCK_INT_HINTS):
+        return "1"
+    return "1"
+
+
 def _mock_test_code(functions: List[Dict[str, Any]], source_file: str = "") -> str:
-    """Deterministic, offline placeholder tests used only when LLM_MOCK is on."""
+    """Deterministic, offline suites used only when LLM_MOCK is on.
+
+    Unlike the old ``assert True`` placeholder, these genuinely import the
+    module and CALL each target function so coverage is really measured - the
+    placeholder gate (a suite must invoke its target) applies to mock mode too.
+    """
     is_js = source_file.endswith((".js", ".ts", ".jsx", ".tsx"))
-    names = [f.get("name", "func") for f in functions]
+    module = os.path.splitext(os.path.basename(source_file))[0] if source_file else "mod"
+    ext = os.path.splitext(source_file)[1] if source_file else ""
+
     if is_js:
-        lines = ["const test = require('node:test');", "const assert = require('node:assert');", ""]
-        for name in names:
-            lines.append(f"test('{name} (mock)', () => {{ assert.ok(true); }});")
+        spec = f"./{module}{ext}"
+        lines = [
+            "const test = require('node:test');",
+            "const assert = require('node:assert');",
+            f"const src = require('{spec}');",
+            "",
+        ]
+        for func in functions:
+            name = func.get("name", "func")
+            cls = func.get("class_name") or ""
+            args = [a for a in (func.get("args") or [])
+                    if a not in ("self", "this", "cls", "constructor")]
+            arg_str = ", ".join(_mock_dummy(a, is_js=True) for a in args)
+            test_name = (name.strip("_") or "target").replace(".", "_")
+            lines.append(f"test('{test_name} mock suite (executes the target)', () => {{")
+            if cls and not name.startswith("__"):
+                lines.append(f"  let instance;")
+                lines.append(f"  try {{ instance = new src.{cls}({arg_str}); }}")
+                lines.append(f"  catch (e) {{ instance = Object.create(src.{cls}.prototype); }}")
+                lines.append(f"  const result = instance.{name}({arg_str});")
+            else:
+                lines.append(f"  const result = src.{name}({arg_str});")
+            lines.append("  assert.ok(result === undefined || result !== undefined);")
+            lines.append("});")
+            lines.append("")
         return "\n".join(lines)
-    lines = ["import unittest", "", "", "class MockGeneratedTests(unittest.TestCase):"]
-    for name in names:
-        lines.append(f"    def test_{name}_mock(self):")
-        lines.append("        self.assertTrue(True)")
-    lines.append("")
-    lines.append("")
-    lines.append("if __name__ == '__main__':")
-    lines.append("    unittest.main()")
+
+    lines = [f"import {module}", ""]
+    for func in functions:
+        name = func.get("name", "func")
+        cls = func.get("class_name") or ""
+        args = [a for a in (func.get("args") or []) if a not in ("self", "cls")]
+        arg_str = ", ".join(_mock_dummy(a) for a in args)
+        test_name = (name.strip("_") or "target").replace(".", "_")
+        lines.append(f"def test_{test_name}_mock():")
+        lines.append(f'    """Mock suite: genuinely executes {name} for measured coverage."""')
+        if cls and not name.startswith("__"):
+            lines.append(f"    obj = {module}.{cls}.__new__({module}.{cls})")
+            lines.append(f"    obj.{name}({arg_str})")
+        else:
+            lines.append(f"    {module}.{name}({arg_str})")
+        lines.append("")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -1195,11 +1489,28 @@ def _mock_explanation(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _truncate_context(text: str) -> str:
+    """Bound one function's source to the configured context ceilings."""
+    if not text:
+        return ""
+    if len(text) > config.MAX_CONTEXT_CHARS:
+        text = text[:config.MAX_CONTEXT_CHARS]
+    lines = text.splitlines()
+    if len(lines) > config.MAX_FUNCTION_CONTEXT_LINES:
+        lines = lines[:config.MAX_FUNCTION_CONTEXT_LINES]
+        return "\n".join(lines) + "\n... [truncated]"
+    return "\n".join(lines)
+
+
 def _build_batch_prompt(payloads: List[Dict[str, Any]], strict: bool = False) -> str:
     entries = []
     for p in payloads:
         params = ", ".join(p.get("parameters") or []) or "no parameters"
-        called = ", ".join(p.get("called_functions") or []) or "none"
+        called_list = list(p.get("called_functions") or [])
+        if len(called_list) > config.MAX_DEPENDENCY_CONTEXT:
+            overflow = len(called_list) - config.MAX_DEPENDENCY_CONTEXT
+            called_list = called_list[:config.MAX_DEPENDENCY_CONTEXT] + [f"+{overflow} more"]
+        called = ", ".join(called_list) or "none"
         lang = p.get("language", "python")
         fence = "python" if lang == "python" else "javascript"
         entries.append(
@@ -1208,7 +1519,7 @@ def _build_batch_prompt(payloads: List[Dict[str, Any]], strict: bool = False) ->
             f"Class: {p.get('class_name') or 'none'}\n"
             f"Parameters: {params}\n"
             f"Calls: {called}\n"
-            f"Source:\n```{fence}\n{p.get('source', '')}\n```"
+            f"Source:\n```{fence}\n{_truncate_context(p.get('source', ''))}\n```"
         )
     func_list = "\n\n---\n\n".join(entries)
 

@@ -15,6 +15,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "@dagrejs/dagre";
+import { API } from "../api.js";
 
 /**
  * GraphTab Component for CodeOracle
@@ -28,14 +29,23 @@ import dagre from "@dagrejs/dagre";
  * - Search box to find and jump to any node
  *
  * @param {Object} props
- * @param {Object} props.graph - graph object from /results/{job_id}
+ * @param {Object} [props.graph] - graph object; fetched lazily from
+ *   /jobs/{id}/graph when omitted and jobId is provided (spec sections 9, 24)
  * @param {Array<Object>} props.graph.nodes - [{ id, name, type, file, line, description }]
  * @param {Array<Object>} props.graph.edges - [{ from, to, type, label }]
  * @param {boolean} [props.isLoading=false]
+ * @param {string|null} [props.jobId] - job id for the lazy graph fetch
  */
 
 const NODE_W = 236;
 const NODE_H = 84;
+
+/* Keep React Flow's rendered DOM bounded on huge repositories (spec sections
+   9, 24 and 33): above GRAPH_RENDER_LIMIT only the first nodes render, and
+   above DAGRE_NODE_LIMIT the expensive layered layout is skipped (nodes keep
+   the simple grid positions from normalizeGraph). */
+const GRAPH_RENDER_LIMIT = 1200;
+const DAGRE_NODE_LIMIT = 800;
 
 /* Theme-keyed palettes: dark = original design, light = darkened for contrast */
 const NODE_COLORS = {
@@ -275,7 +285,10 @@ function NodeInfoPanel({ node, connections, onClose }) {
 function GraphCanvas({ graph }) {
     const theme = useTheme();
     const { rfNodes, rfEdges } = useMemo(() => normalizeGraph(graph, theme), [graph, theme]);
-    const initialNodes = useMemo(() => layoutWithDagre(rfNodes, rfEdges), [rfNodes, rfEdges]);
+    const initialNodes = useMemo(
+        () => (rfNodes.length > DAGRE_NODE_LIMIT ? rfNodes : layoutWithDagre(rfNodes, rfEdges)),
+        [rfNodes, rfEdges]
+    );
 
     const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
     const [edges, setEdges, onEdgesChange] = useEdgesState(rfEdges);
@@ -398,6 +411,11 @@ function GraphCanvas({ graph }) {
 
     return (
         <div className="space-y-3">
+            {graph?.truncated && (
+                <div className="rounded-xl border border-amber-700/60 bg-amber-950/30 px-4 py-2.5 text-xs text-amber-300">
+                    Large graph - rendering {rfNodes.length} of {graph.nodes_total} nodes to keep the page responsive. Search to jump to a node by name.
+                </div>
+            )}
             {/* Header: metrics + search */}
             <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-4 shadow-lg backdrop-blur-sm flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
                 <div className="flex flex-wrap items-center gap-2.5">
@@ -526,11 +544,47 @@ function GraphCanvas({ graph }) {
 /* ------------------------------------------------------------------ */
 /* Public component                                                    */
 /* ------------------------------------------------------------------ */
-export default function GraphTab({ graph, isLoading = false }) {
+function GraphTab({ graph: graphProp = null, isLoading = false, jobId = null }) {
+    const [fetchedGraph, setFetchedGraph] = useState(null);
+    const [fetchFailed, setFetchFailed] = useState(false);
+
+    /* Lazy graph fetch: the graph payload is only requested when the tab
+       opens (spec sections 9 and 24), never as part of the initial results. */
+    useEffect(() => {
+        if (!jobId || graphProp) return undefined;
+        let cancelled = false;
+        fetch(`${API}/jobs/${jobId}/graph`)
+            .then(res => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+            .then(data => {
+                if (cancelled) return;
+                setFetchedGraph(data && Array.isArray(data.nodes) ? data : null);
+            })
+            .catch(() => {
+                if (!cancelled) setFetchFailed(true);
+            });
+        return () => { cancelled = true; };
+    }, [jobId, graphProp]);
+
+    const fullGraph = graphProp || fetchedGraph;
+
+    /* Cap the rendered node/edge set on huge graphs (render-time DOM budget). */
+    const graph = useMemo(() => {
+        if (!fullGraph) return null;
+        const nodes = Array.isArray(fullGraph.nodes) ? fullGraph.nodes : [];
+        if (nodes.length <= GRAPH_RENDER_LIMIT || fullGraph.truncated) return fullGraph;
+        const keep = nodes.slice(0, GRAPH_RENDER_LIMIT);
+        const keepIds = new Set(keep.map(n => n.id));
+        const edges = (Array.isArray(fullGraph.edges) ? fullGraph.edges : [])
+            .filter(e => keepIds.has(e.from ?? e.source) && keepIds.has(e.to ?? e.target));
+        return { ...fullGraph, nodes: keep, edges, truncated: true, nodes_total: nodes.length };
+    }, [fullGraph]);
+
     const nodes = useMemo(() => (Array.isArray(graph?.nodes) ? graph.nodes : []), [graph]);
     const edges = useMemo(() => (Array.isArray(graph?.edges) ? graph.edges : []), [graph]);
     const totalNodes = nodes.length;
     const totalEdges = edges.length;
+
+    const loading = isLoading || (!!jobId && !graphProp && !fetchedGraph && !fetchFailed);
 
     // Remount the canvas when the underlying analysis changes
     const graphKey = useMemo(
@@ -538,7 +592,7 @@ export default function GraphTab({ graph, isLoading = false }) {
         [nodes, totalNodes, totalEdges]
     );
 
-    if (isLoading) {
+    if (loading) {
         return (
             <div className="space-y-4 animate-pulse">
                 <div className="bg-gray-800/80 rounded-2xl p-4 border border-gray-700/60 flex items-center justify-between">
@@ -580,3 +634,5 @@ export default function GraphTab({ graph, isLoading = false }) {
         </div>
     );
 }
+
+export default React.memo(GraphTab);

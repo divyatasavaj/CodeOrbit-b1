@@ -3,10 +3,66 @@ import FunctionPicker from "./FunctionPicker.jsx";
 import { API } from "../api.js";
 
 /**
- * Hard numeric threshold for code coverage compliance (PS-06 requirement).
- * Must use exact >= 60% boundary across all bars, borders, and summary counts.
+ * Hard numeric threshold for code coverage compliance.
+ * Mirrors the backend minimum (CODEORACLE_MIN_TEST_COVERAGE, default 65%) and
+ * must use the exact >= boundary across all bars, borders, and summary counts.
+ * The percentage shown is always the real measured coverage from the backend -
+ * it is never rounded up or synthesized here.
  */
-export const COVERAGE_THRESHOLD = 60;
+export const COVERAGE_THRESHOLD = 65;
+
+/**
+ * Spec sections 32/34/35: the backend reports an explicit status for every
+ * generated suite; badges are driven by it (with a derivation fallback for
+ * entries stored before the field existed).
+ */
+export const TEST_STATUS_META = {
+    SUCCESS: {
+        label: "Success",
+        icon: "✓",
+        badgeClass: "bg-emerald-950/90 border-emerald-700 text-emerald-300",
+        tip: "Tests executed, passed, and reached the minimum measured coverage.",
+    },
+    TARGET_NOT_REACHED: {
+        label: "Target not reached",
+        icon: "◑",
+        badgeClass: "bg-amber-950/80 border-amber-700 text-amber-300",
+        tip: "Tests ran and passed, but measured coverage stayed below the target (best real result).",
+    },
+    TEST_FAILURE: {
+        label: "Tests failed",
+        icon: "✗",
+        badgeClass: "bg-rose-950/90 border-rose-700 text-rose-300",
+        tip: "Tests executed but one or more failed.",
+    },
+    EXECUTION_FAILURE: {
+        label: "Execution failed",
+        icon: "⚠",
+        badgeClass: "bg-rose-950/90 border-rose-700 text-rose-300",
+        tip: "Test execution could not be completed (nothing was executed).",
+    },
+    GENERATION_FAILURE: {
+        label: "Generation failed",
+        icon: "✗",
+        badgeClass: "bg-rose-950/90 border-rose-700 text-rose-300",
+        tip: "No usable test suite could be generated for this function.",
+    },
+};
+
+export function deriveTestStatus(item) {
+    if (item.status) return item.status;
+    const tr = item.test_results || {};
+    const executed = Number(item.executed) ||
+        (Number(tr.passed || 0) + Number(tr.failed || 0) + Number(tr.errors || 0));
+    const passed = Boolean(item.passed);
+    const target = Number(item.coverage_target ?? item.min_coverage ?? COVERAGE_THRESHOLD) || COVERAGE_THRESHOLD;
+    const cov = Number(item.coverage_percent);
+    const hasCov = typeof item.coverage_percent === "number" && !isNaN(item.coverage_percent);
+    if (!item.test_code) return "GENERATION_FAILURE";
+    if (executed > 0 && !passed) return "TEST_FAILURE";
+    if (executed > 0 && passed) return hasCov && cov >= target ? "SUCCESS" : "TARGET_NOT_REACHED";
+    return passed ? (hasCov && cov >= target ? "SUCCESS" : "TARGET_NOT_REACHED") : "TEST_FAILURE";
+}
 
 /**
  * Validates if a coverage percentage value is numeric and valid.
@@ -124,7 +180,7 @@ function CopyButton({ code }) {
  * Generated Tests Tab Component
  * 
  * Displays per-function unit tests, exact executed code coverage metrics,
- * pass/fail execution status, and compliance summary with the 60% threshold.
+ * pass/fail execution status, and compliance summary with the configured threshold.
  * 
  * @param {Object} props
  * @param {Array<Object>} [props.tests] - Array of test result objects from /results/{job_id}
@@ -133,7 +189,7 @@ function CopyButton({ code }) {
  * @param {string|null} [props.jobId] - Job id for the on-demand generation endpoint
  * @param {Function} [props.onUpdate] - Functional updater to merge generated entries into results
  */
-export default function TestsTab({ tests, isLoading = false, explanation, jobId, onUpdate }) {
+function TestsTab({ tests, isLoading = false, explanation, jobId, onUpdate }) {
     const [searchQuery, setSearchQuery] = useState("");
     const [filterMode, setFilterMode] = useState("all"); // 'all' | 'meets' | 'below' | 'passed' | 'failed'
     const [expandedOutputs, setExpandedOutputs] = useState({});
@@ -184,6 +240,24 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
             const testCode = item.test_code ?? item.testCode ?? item.code ?? "";
             const testOutput = item.test_output ?? item.testOutput ?? item.output ?? "";
             const error = item.error ?? null;
+            // Coverage-gate metadata from the backend's generate/measure/improve loop.
+            const meetsMinCoverage = item.meets_min_coverage ?? item.meetsMinCoverage ?? null;
+            const coverageAttempts = Number(
+                item.attempts ?? item.coverage_attempts ?? item.coverageAttempts ?? 1
+            ) || 1;
+            // Backend is the source of truth for the target; fall back to the
+            // mirrored constant for entries generated before the field existed.
+            const coverageTarget = Number(item.coverage_target ?? item.min_coverage ?? COVERAGE_THRESHOLD) || COVERAGE_THRESHOLD;
+            const targetMet = meetsMinCoverage !== null
+                ? meetsMinCoverage === true
+                : (validCov !== null ? validCov >= coverageTarget : null);
+            // Spec section 34: coverage is scoped to the FUNCTION's own lines
+            // (FILE only when the function range could not be mapped).
+            const coverageScope = item.coverage_scope ?? item.coverageScope ?? null;
+            const rawFileCov = item.file_coverage_percent ?? item.fileCoveragePercent ?? null;
+            const fileCoverage = isCoverageValid(rawFileCov) ? Number(rawFileCov) : null;
+            const failureCategory = item.failure_category ?? item.failureCategory ?? null;
+            const status = deriveTestStatus(item);
 
             return {
                 id: `test-item-${idx}-${rawName}`,
@@ -194,7 +268,18 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                 passed,
                 testCode,
                 testOutput,
-                error
+                error,
+                meetsMinCoverage,
+                coverageTarget,
+                targetMet,
+                attempts: coverageAttempts,
+                status,
+                coverageScope,
+                fileCoverage,
+                failureCategory,
+                // Reported as a best effort (never as a success) when the
+                // MEASURED coverage stayed below the target.
+                bestEffort: targetMet === false
             };
         });
     }, [tests]);
@@ -303,6 +388,7 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                     generateLabel="Generate Tests"
                     title="Generate Tests On Demand"
                     description="The initial analysis produces explanations and the dependency graph only — skipping test generation to save time. Pick any function below to generate its unit test suite with real coverage (one AI call per function, a few seconds)."
+                    jobId={jobId}
                     onGenerate={handleGenerate}
                 />
             </div>
@@ -326,6 +412,7 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                         generateLabel="Generate Tests"
                         title="Generate Tests For Another Function"
                         description="One AI call per function. Results appear in the list below as soon as coverage finishes running."
+                        jobId={jobId}
                         onGenerate={handleGenerate}
                     />
                     <div className="flex justify-end">
@@ -353,7 +440,7 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
             {/* 1. Summary Header Card */}
             <div className="bg-gray-800/90 border border-gray-700/80 rounded-2xl p-6 shadow-xl backdrop-blur-sm space-y-5">
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                    {/* Primary Requirement: "X of Y functions meet the 60% threshold" */}
+                    {/* Primary requirement: "X of Y functions meet the coverage threshold" */}
                     <div>
                         <div className="flex items-center gap-3">
                             <h3 className="text-lg md:text-xl font-bold text-fg tracking-tight">
@@ -459,7 +546,7 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                             }`}
                             type="button"
                         >
-                            ≥ 60% ({meetsThresholdCount})
+                            ≥ {COVERAGE_THRESHOLD}% ({meetsThresholdCount})
                         </button>
                         <button
                             onClick={() => setFilterMode("below")}
@@ -470,7 +557,7 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                             }`}
                             type="button"
                         >
-                            &lt; 60% ({totalCount - meetsThresholdCount})
+                            &lt; {COVERAGE_THRESHOLD}% ({totalCount - meetsThresholdCount})
                         </button>
                     </div>
                 </div>
@@ -483,7 +570,7 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                     const hasCov = item.hasValidCoverage;
                     const coverageValue = item.coverage;
 
-                    // Hard requirement: red left border when coverage < 60%, neutral/green when >= 60%
+                    // Hard requirement: red left border when coverage is below the threshold
                     const borderStyle = hasCov
                         ? (meets ? "border-l-4 border-l-emerald-500" : "border-l-4 border-l-rose-500")
                         : "border-l-4 border-l-gray-600";
@@ -502,6 +589,19 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                                 </div>
 
                                 <div className="flex flex-wrap items-center gap-2.5">
+                                    {/* 0. Explicit status badge (spec section 35) */}
+                                    {TEST_STATUS_META[item.status] && (
+                                        <div
+                                            className={`px-3 py-1 rounded-xl text-xs font-bold border flex items-center gap-1.5 ${TEST_STATUS_META[item.status].badgeClass}`}
+                                            title={item.failureCategory
+                                                ? `${TEST_STATUS_META[item.status].tip} (${item.failureCategory})`
+                                                : TEST_STATUS_META[item.status].tip}
+                                        >
+                                            <span>{TEST_STATUS_META[item.status].icon}</span>
+                                            <span>{TEST_STATUS_META[item.status].label}</span>
+                                        </div>
+                                    )}
+
                                     {/* 1. Coverage percentage number badge */}
                                     <div
                                         className={`px-3 py-1 rounded-xl text-xs font-bold border flex items-center gap-1.5 ${
@@ -511,13 +611,39 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                                                 ? "bg-emerald-950/90 border-emerald-700 text-emerald-300"
                                                 : "bg-rose-950/90 border-rose-700 text-rose-300"
                                         }`}
-                                        title={hasCov ? `${coverageValue}% real line coverage` : "Coverage data not available"}
+                                        title={hasCov
+                                            ? `${coverageValue}% real line coverage` +
+                                              (item.coverageScope === "FUNCTION"
+                                                  ? " of this function's own lines" +
+                                                    (item.fileCoverage !== null ? ` (file: ${item.fileCoverage}%)` : "")
+                                                  : " (whole file - function range not mapped)")
+                                            : "Coverage data not available"}
                                     >
                                         <span className={`w-2 h-2 rounded-full ${
                                             !hasCov ? "bg-gray-500" : meets ? "bg-emerald-400" : "bg-rose-400"
                                         }`}></span>
                                         <span>{hasCov ? `${coverageValue}% Coverage` : "N/A Coverage"}</span>
+                                        {hasCov && item.coverageScope === "FUNCTION" && (
+                                            <span className="opacity-70 font-normal">fn</span>
+                                        )}
                                     </div>
+
+                                    {/* Target status: the configured minimum vs the REAL measured value */}
+                                    {hasCov && (
+                                        <div
+                                            className={`px-3 py-1 rounded-xl text-xs font-semibold border flex items-center gap-1.5 ${
+                                                item.targetMet
+                                                    ? "bg-emerald-950/90 border-emerald-700 text-emerald-300"
+                                                    : "bg-rose-950/90 border-rose-700 text-rose-300"
+                                            }`}
+                                            title={`Minimum measured coverage target: ${item.coverageTarget}%`}
+                                        >
+                                            <span>{item.targetMet ? "✓" : "⚠"}</span>
+                                            <span>
+                                                Target: {item.coverageTarget}% {item.targetMet ? "reached" : "not reached"}
+                                            </span>
+                                        </div>
+                                    )}
 
                                     {/* 2. Distinct Test Run Pass/Fail badge (independent of coverage threshold) */}
                                     <div
@@ -536,7 +662,16 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                             {/* Per-Function Coverage Bar (0–100%) */}
                             <div className="space-y-1.5">
                                 <div className="flex justify-between text-[11px] font-mono text-gray-400">
-                                    <span>Coverage Proportion</span>
+                                    <span>
+                                        {item.coverageScope === "FUNCTION"
+                                            ? "Function Coverage"
+                                            : item.coverageScope === "FILE"
+                                            ? "File Coverage"
+                                            : "Coverage Proportion"}
+                                        {item.coverageScope === "FUNCTION" && item.fileCoverage !== null && (
+                                            <span className="opacity-70"> (file {item.fileCoverage}%)</span>
+                                        )}
+                                    </span>
                                     <span className={meets ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>
                                         {hasCov ? `${coverageValue}% / 100%` : "N/A"}
                                     </span>
@@ -553,6 +688,35 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
                                     )}
                                 </div>
                             </div>
+
+                            {/* Generation failure: nothing usable was produced - show the
+                                reason right on the card instead of an empty code block. */}
+                            {item.status === "GENERATION_FAILURE" && item.error && (
+                                <div className="flex items-start gap-2 rounded-xl border border-rose-700/60 bg-rose-950/40 px-3.5 py-2.5 text-xs text-rose-300">
+                                    <svg className="w-4 h-4 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                    </svg>
+                                    <span className="font-mono whitespace-pre-wrap break-all">
+                                        {String(item.error).slice(0, 500)}
+                                    </span>
+                                </div>
+                            )}
+
+                            {/* Honest below-target notice: the suite was re-generated but the
+                                MEASURED coverage still fell short of the configured minimum. */}
+                            {item.bestEffort && (
+                                <div className="flex items-start gap-2 rounded-xl border border-amber-700/60 bg-amber-950/40 px-3.5 py-2.5 text-xs text-amber-300">
+                                    <svg className="w-4 h-4 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                                    </svg>
+                                    <span>
+                                        Best effort — not a success: the tests were regenerated{" "}
+                                        {item.attempts > 1 ? `${item.attempts} times` : "once"} but only reached{" "}
+                                        {hasCov ? `${coverageValue}%` : "unmeasured"} measured coverage, below the{" "}
+                                        {item.coverageTarget}% target. The value shown is the real measured result.
+                                    </span>
+                                </div>
+                            )}
 
                             {/* Code Display + Copy Button */}
                             <div className="relative mt-2">
@@ -607,3 +771,5 @@ export default function TestsTab({ tests, isLoading = false, explanation, jobId,
         </div>
     );
 }
+
+export default React.memo(TestsTab);

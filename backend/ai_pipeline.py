@@ -189,6 +189,85 @@ def _store(state: JobState, func, explanation: Dict[str, Any], ai_status: str) -
     return entry
 
 
+def _warmup_sync(state: JobState, ordered: List[Any], is_trivial) -> Any:
+    """Cache/trivial pre-pass. Runs in a worker thread: over thousands of
+    functions the per-function cache reads and JSON writes add up to seconds
+    of event-loop stall if left inline (spec sections 6, 22 and 31)."""
+    to_generate: List[Any] = []
+    cached_entries: List[Dict[str, Any]] = []
+
+    for func in ordered:
+        if state.cancelled:
+            break
+        cached = cache.get_operation_cached(
+            "explanation",
+            func.source_code,
+            config.PROMPT_VERSION_EXPLANATION,
+            config.MODEL,
+            func.id,
+        )
+        if isinstance(cached, dict) and llm.validate_explanation_object(cached):
+            state.cached += 1
+            state.completed += 1
+            cached_entries.append(_store(state, func, cached, "cached"))
+        elif is_trivial is not None and is_trivial(func.source_code):
+            # Deterministic local explanation: never spend an LLM call on a
+            # trivial getter/setter/init wrapper.
+            state.trivial += 1
+            state.completed += 1
+            cached_entries.append(_store(state, func, _ast_fallback(func), "trivial_skipped"))
+        else:
+            to_generate.append(func)
+
+    return to_generate, cached_entries
+
+
+def _persist_batch_sync(job_id: str, batch: List[Any], parsed: Dict[str, Any], error: Optional[Exception]) -> Any:
+    """Persist one batch's results (AST fallback + cache writes + per-function
+    JSON files). Runs in a worker thread so fsyncs never touch the loop."""
+    entries: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+
+    for func in batch:
+        explanation = parsed.get(func.id)
+        if explanation:
+            try:
+                cache.set_operation_cached(
+                    "explanation",
+                    func.source_code,
+                    config.PROMPT_VERSION_EXPLANATION,
+                    config.MODEL,
+                    explanation,
+                    func.id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            ai_status = "ai"
+        else:
+            explanation = _ast_fallback(func)
+            ai_status = "ast_fallback"
+            reason = str(error) if error else "invalid or missing JSON for this function"
+            failures.append(
+                {"function_id": func.id, "name": func.qualified_name, "filename": func.filename, "reason": reason}
+            )
+
+        entry = {
+            "function_id": func.id,
+            "filename": func.filename,
+            "name": func.qualified_name,
+            "explanation": explanation,
+            "ai_status": ai_status,
+        }
+        try:
+            import job_store
+            job_store.save_explanation(job_id, func.id, entry)
+        except Exception as exc:  # noqa: BLE001 - persistence must never break analysis
+            logger.debug(f"Explanation persist skipped for {func.id}: {exc}")
+        entries.append(entry)
+
+    return entries, failures
+
+
 def _ast_fallback(func) -> Dict[str, Any]:
     return llm.normalize_explanation_item(
         llm.analyze_function_ast(
@@ -268,29 +347,11 @@ async def run_ai_analysis(
     try:
         ordered = registry_mod.order_functions(registry)
         is_trivial = hooks.get("is_trivial")
-        to_generate: List[Any] = []
-        cached_entries: List[Dict[str, Any]] = []
-
-        for func in ordered:
-            cached = cache.get_operation_cached(
-                "explanation",
-                func.source_code,
-                config.PROMPT_VERSION_EXPLANATION,
-                config.MODEL,
-                func.id,
-            )
-            if isinstance(cached, dict) and llm.validate_explanation_object(cached):
-                state.cached += 1
-                state.completed += 1
-                cached_entries.append(_store(state, func, cached, "cached"))
-            elif is_trivial is not None and is_trivial(func.source_code):
-                # Deterministic local explanation: never spend an LLM call on a
-                # trivial getter/setter/init wrapper.
-                state.trivial += 1
-                state.completed += 1
-                cached_entries.append(_store(state, func, _ast_fallback(func), "trivial_skipped"))
-            else:
-                to_generate.append(func)
+        to_generate: List[Any]
+        cached_entries: List[Dict[str, Any]]
+        to_generate, cached_entries = await asyncio.to_thread(
+            _warmup_sync, state, ordered, is_trivial
+        )
 
         batches = registry_mod.create_batches(to_generate)
         state.batches_total = len(batches)
@@ -422,28 +483,18 @@ async def _worker(state: JobState, queue: "asyncio.Queue", on_progress, on_batch
                 error = error or exc
                 logger.warning(f"[AI] job={state.job_id} batch={index} strict retry failed: {exc}")
 
-        entries: List[Dict[str, Any]] = []
-        for func in batch:
-            explanation = parsed.get(func.id)
-            if explanation:
-                cache.set_operation_cached(
-                    "explanation",
-                    func.source_code,
-                    config.PROMPT_VERSION_EXPLANATION,
-                    config.MODEL,
-                    explanation,
-                    func.id,
-                )
-                entries.append(_store(state, func, explanation, "ai"))
-                if state.first_result_at is None:
-                    state.first_result_at = time.time()
-            else:
-                reason = str(error) if error else "invalid or missing JSON for this function"
-                state.failed += 1
-                state.failed_functions.append(
-                    {"function_id": func.id, "name": func.qualified_name, "filename": func.filename, "reason": reason}
-                )
-                entries.append(_store(state, func, _ast_fallback(func), "ast_fallback"))
+        # Disk writes (cache + per-function JSON + AST fallback) run in a
+        # worker thread: at 10 functions/batch the fsyncs used to add ~100ms
+        # of event-loop stall per batch (spec sections 23 and 31).
+        entries, failures = await asyncio.to_thread(
+            _persist_batch_sync, state.job_id, batch, parsed, error
+        )
+
+        if any(f.id in parsed for f in batch) and state.first_result_at is None:
+            state.first_result_at = time.time()
+        if failures:
+            state.failed += len(failures)
+            state.failed_functions.extend(failures)
 
         state.completed += len(batch)
         state.batches_completed += 1
