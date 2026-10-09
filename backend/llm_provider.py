@@ -11,7 +11,7 @@ import asyncio
 import logging
 import httpx
 from abc import ABC, abstractmethod
-from typing import List, Optional, Any
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -23,8 +23,32 @@ if env_path.exists():
 else:
     load_dotenv()
 
+def _configured_groq_keys() -> List[str]:
+    """Every Groq key configured, from GROQ_API_KEYS or the single-key var."""
+    raw = os.environ.get("GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY") or ""
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+# Each Groq key carries its own ~8k tokens/minute and 200k tokens/day, so the
+# key count is the natural width for concurrent requests: one in flight per key
+# keeps every key inside its own window instead of queueing behind one cap.
+# Occupied keys are skipped by rotation, so this stays correct if some are off.
+GROQ_KEY_COUNT = max(1, len(_configured_groq_keys()))
+
 MAX_LLM_RETRIES = int(os.environ.get("MAX_LLM_RETRIES", "2"))
-MAX_CONCURRENT_LLM_REQUESTS = int(os.environ.get("MAX_CONCURRENT_LLM_REQUESTS", "2"))
+MAX_CONCURRENT_LLM_REQUESTS = max(
+    1, int(os.environ.get("MAX_CONCURRENT_LLM_REQUESTS", str(GROQ_KEY_COUNT)))
+)
+# Aggregate throughput ceiling across all keys, used by the router's budget
+# limiter (8k tokens/minute per Groq key).
+LLM_TOKENS_PER_MINUTE = max(
+    1000, int(os.environ.get("LLM_TOKENS_PER_MINUTE", str(GROQ_KEY_COUNT * 8000)))
+)
+# Same logic for the daily ceiling: the router must not stop at one key's
+# 200k/day while the rest of the pool still has budget.
+LLM_TOKENS_PER_DAY = max(
+    1000, int(os.environ.get("LLM_TOKENS_PER_DAY", str(GROQ_KEY_COUNT * 200_000)))
+)
 LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "0.3"))
 LLM_RETRY_MAX_DELAY = float(os.environ.get("LLM_RETRY_MAX_DELAY", "2.0"))
 # Rate-limit (429) retries are counted separately and wait for the window the
@@ -170,8 +194,7 @@ class GroqProvider(LLMProvider):
         # One key, or several comma-separated keys in GROQ_API_KEYS. Every key
         # carries its own 8k tokens/minute and 200k tokens/day budget, so
         # adding keys multiplies throughput instead of queueing behind one cap.
-        raw_keys = os.environ.get("GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY") or ""
-        self.api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        self.api_keys = _configured_groq_keys()
         self.api_key = self.api_keys[0] if self.api_keys else None
         self.default_model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
         self._client: Optional[httpx.AsyncClient] = None
@@ -201,6 +224,19 @@ class GroqProvider(LLMProvider):
 
     def is_available(self) -> bool:
         return self._client is not None and bool(self._available_key_indices())
+
+    def key_status(self) -> List[Dict[str, Any]]:
+        """Per-key availability for diagnostics; never exposes the key itself."""
+        now = time.time()
+        return [
+            {
+                "index": i + 1,
+                "available": now >= self._key_quota_until[i],
+                "resets_in_seconds": max(0.0, round(self._key_quota_until[i] - now, 1)),
+                "fingerprint": self.api_keys[i][-4:] if self.api_keys[i] else "",
+            }
+            for i in range(len(self.api_keys))
+        ]
 
     async def generate(self, prompt: str, model: Optional[str] = None) -> str:
         if not self._client:
@@ -411,8 +447,7 @@ class LLMRouter:
         self.fallback_provider = None
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
         self.token_budget_limiter = TokenBudgetLimiter(
-            int(os.environ.get("LLM_TOKENS_PER_MINUTE", "28000")),
-            int(os.environ.get("LLM_TOKENS_PER_DAY", "1000000"))
+            LLM_TOKENS_PER_MINUTE, LLM_TOKENS_PER_DAY
         )
         
         provider_name = os.environ.get("LLM_PROVIDER", "groq").lower()

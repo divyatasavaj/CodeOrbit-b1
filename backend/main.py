@@ -442,6 +442,40 @@ async def health_check():
     return {"status": "ok", "message": "CodeOracle is running", "version": "2.0.0"}
 
 
+@app.get("/llm/status")
+async def llm_status():
+    """Which provider/model and how many API keys are actually in the pool.
+
+    Exposes only a per-key *availability* flag and the last 4 characters of each
+    key, never the key itself. Use it to confirm a freshly pasted multi-key
+    ``GROQ_API_KEYS`` pool was picked up and to see keys parked on daily quota.
+    """
+    try:
+        router = llm_provider.get_llm_provider()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never 500
+        return {"error": str(exc)}
+
+    groq = getattr(router, "groq", None)
+    keys = groq.key_status() if groq is not None else []
+    return {
+        "provider": os.environ.get("LLM_PROVIDER", "groq"),
+        "groq_model": getattr(groq, "default_model", None),
+        "gemini_model": getattr(getattr(router, "gemini", None), "default_model", None),
+        "key_count": len(keys),
+        "groq_concurrency": llm_provider.MAX_CONCURRENT_LLM_REQUESTS,
+        "tokens_per_minute": llm_provider.LLM_TOKENS_PER_MINUTE,
+        "tokens_per_day": llm_provider.LLM_TOKENS_PER_DAY,
+        "groq_available": bool(groq is not None and groq.is_available()),
+        "gemini_available": bool(
+            getattr(router, "gemini", None) is not None
+            and router.gemini.is_available()
+        ),
+        "primary": getattr(router.primary_provider, "name", None),
+        "fallback": getattr(router.fallback_provider, "name", None),
+        "keys": keys,
+    }
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     return Response(content=b"", media_type="image/x-icon", status_code=204)

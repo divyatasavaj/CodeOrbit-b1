@@ -42,7 +42,15 @@ def _bool(name: str, default: bool) -> bool:
 # LLM batching / concurrency
 # --------------------------------------------------------------------------
 LLM_BATCH_SIZE = max(1, _int("CODEORACLE_LLM_BATCH_SIZE", 10))
-LLM_CONCURRENCY = max(1, _int("CODEORACLE_LLM_CONCURRENCY", 5))
+# Every configured Groq key is an independent 8k tokens/minute budget, so the
+# number of keys is the natural degree of parallelism. Falls back to 1 with a
+# single key so one account never bursts past its own window.
+GROQ_KEY_COUNT = max(1, len([
+    k for k in (
+        os.environ.get("GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY") or ""
+    ).split(",") if k.strip()
+]))
+LLM_CONCURRENCY = max(1, _int("CODEORACLE_LLM_CONCURRENCY", GROQ_KEY_COUNT))
 LLM_MAX_RETRIES = max(0, _int("CODEORACLE_LLM_MAX_RETRIES", 2))
 LLM_TIMEOUT = max(5.0, _float("CODEORACLE_LLM_TIMEOUT", 60.0))
 # Approximate source-character ceiling for a single batch. Batches split early

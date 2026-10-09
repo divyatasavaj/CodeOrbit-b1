@@ -40,8 +40,10 @@ SEM = asyncio.Semaphore(config.LLM_CONCURRENCY)
 INTERACTIVE_CTX: contextvars.ContextVar = contextvars.ContextVar(
     "codeoracle_interactive", default=False
 )
+# Interactive clicks run as wide as the key pool, so several functions can be
+# generated at once without contending for a single key's window.
 INTERACTIVE_SEM = asyncio.Semaphore(max(1, int(os.environ.get(
-    "CODEORACLE_LLM_INTERACTIVE_CONCURRENCY", "2"))))
+    "CODEORACLE_LLM_INTERACTIVE_CONCURRENCY", str(config.GROQ_KEY_COUNT)))))
 _interactive_inflight = 0
 _interactive_idle: Optional[asyncio.Event] = None
 
