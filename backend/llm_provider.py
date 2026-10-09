@@ -11,7 +11,7 @@ import asyncio
 import logging
 import httpx
 from abc import ABC, abstractmethod
-from typing import Optional, Any
+from typing import List, Optional, Any
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -167,109 +167,128 @@ class GroqProvider(LLMProvider):
     GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
     
     def __init__(self):
-        self.api_key = os.environ.get("GROQ_API_KEY")
+        # One key, or several comma-separated keys in GROQ_API_KEYS. Every key
+        # carries its own 8k tokens/minute and 200k tokens/day budget, so
+        # adding keys multiplies throughput instead of queueing behind one cap.
+        raw_keys = os.environ.get("GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY") or ""
+        self.api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        self.api_key = self.api_keys[0] if self.api_keys else None
         self.default_model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
         self._client: Optional[httpx.AsyncClient] = None
-        # Wall-clock time until which the daily token budget stays exhausted.
-        self._quota_exhausted_until = 0.0
+        # Per-key wall-clock time until which that key's daily budget is spent.
+        self._key_quota_until = [0.0] * len(self.api_keys)
+        self._key_index = 0
         self._init_client()
-    
+
     @property
     def name(self) -> str: return "groq"
-    
+
     def _init_client(self):
-        if not self.api_key:
-            logger.warning("GROQ_API_KEY not set")
+        if not self.api_keys:
+            logger.warning("GROQ_API_KEY / GROQ_API_KEYS not set")
             return
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5.0, read=60.0, write=5.0, pool=5.0),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
-        logger.info(f"Groq initialized (raw httpx): model={self.default_model}")
-    
+        logger.info(
+            f"Groq initialized (raw httpx): model={self.default_model} keys={len(self.api_keys)}"
+        )
+
+    def _available_key_indices(self) -> List[int]:
+        now = time.time()
+        return [i for i in range(len(self.api_keys)) if now >= self._key_quota_until[i]]
+
     def is_available(self) -> bool:
-        if time.time() < self._quota_exhausted_until:
-            return False
-        return self._client is not None and self.api_key is not None
-    
+        return self._client is not None and bool(self._available_key_indices())
+
     async def generate(self, prompt: str, model: Optional[str] = None) -> str:
         if not self._client:
             raise ValueError("Groq client not initialized. Check GROQ_API_KEY.")
         model_name = model or self.default_model
-        request_start = time.time()
 
-        attempt = 0
-        rate_limit_attempts = 0
-        rate_limit_waited = 0.0
-        while attempt <= MAX_LLM_RETRIES:
-            try:
+        last_error: Optional[Exception] = None
+        wait_hint = 0.0
+        waited = 0.0
+
+        for round_index in range(GROQ_429_MAX_RETRIES + 1):
+            key_indices = self._available_key_indices()
+            if not key_indices:
+                raise last_error or QuotaExhaustedError(
+                    "groq",
+                    f"all {len(self.api_keys)} Groq API key(s) have spent their daily token budget",
+                )
+
+            # Spread load across keys, starting after the last one used.
+            start = self._key_index % len(key_indices)
+            self._key_index += 1
+            ordered = key_indices[start:] + key_indices[:start]
+
+            for key_index in ordered:
                 resp = await self._client.post(
                     self.GROQ_API_URL,
-                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                    json={"model": model_name, "messages": [{"role": "user", "content": prompt}], "max_tokens": GROQ_MAX_OUTPUT_TOKENS, "temperature": 0.3},
+                    headers={
+                        "Authorization": f"Bearer {self.api_keys[key_index]}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": GROQ_MAX_OUTPUT_TOKENS,
+                        "temperature": 0.3,
+                    },
                 )
-                
+
                 if resp.status_code == 200:
                     data = resp.json()
                     text = data["choices"][0]["message"]["content"].strip()
                     if not text:
                         raise Exception("Empty response from Groq")
                     return text
-                
+
                 if resp.status_code == 429:
                     body = resp.text or ""
                     if _is_daily_quota_message(body):
                         reset_in = max(_seconds_until_retry(body), 60.0)
-                        self._quota_exhausted_until = time.time() + reset_in
+                        self._key_quota_until[key_index] = time.time() + reset_in
                         logger.warning(
-                            "Groq DAILY token budget exhausted (resets in %.1f min); "
-                            "pausing Groq and using the fallback provider: %s",
-                            reset_in / 60.0, body[:200],
+                            "Groq key #%d daily budget exhausted (resets in %.1f min); rotating to the next key",
+                            key_index + 1, reset_in / 60.0,
                         )
-                        raise QuotaExhaustedError("groq", body[:300])
-                    retry_after = _groq_retry_after(resp)
-                    waited = retry_after * (2 ** rate_limit_attempts)
-                    if (
-                        rate_limit_attempts < GROQ_429_MAX_RETRIES
-                        and rate_limit_waited + waited <= GROQ_429_TOTAL_WAIT
-                    ):
-                        rate_limit_attempts += 1
-                        jitter = random.uniform(0, 0.5)
-                        wait = min(waited + jitter, GROQ_429_MAX_WAIT)
-                        rate_limit_waited += wait
-                        logger.warning(
-                            "Groq rate limited (429); waiting %.1fs then retrying (%d/%d, %.1fs of %.1fs budget used)",
-                            wait, rate_limit_attempts, GROQ_429_MAX_RETRIES,
-                            rate_limit_waited, GROQ_429_TOTAL_WAIT,
+                        last_error = QuotaExhaustedError("groq", body[:300])
+                    else:
+                        wait_hint = _groq_retry_after(resp)
+                        last_error = RateLimitError("groq", wait_hint, body[:300])
+                        logger.info(
+                            "Groq key #%d hit its per-minute window; trying another key",
+                            key_index + 1,
                         )
-                        await asyncio.sleep(wait)
-                        continue
-                    raise RateLimitError(
-                        "groq", retry_after,
-                        f"429 after {rate_limit_attempts} rate-limit retries "
-                        f"({rate_limit_waited:.1f}s waited)",
-                    )
-                
-                if resp.status_code in (503, 502):
-                    if attempt < MAX_LLM_RETRIES:
-                        base_delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
-                        delay = min(base_delay, 3.0)
-                        await asyncio.sleep(delay)
-                        attempt += 1
-                        continue
-                
-                raise Exception(f"Groq API error {resp.status_code}: {resp.text[:500]}")
-            
-            except httpx.TimeoutException:
-                if attempt < MAX_LLM_RETRIES:
-                    await asyncio.sleep(LLM_RETRY_BASE_DELAY * (2 ** attempt))
-                    attempt += 1
+                    continue  # another key may still have headroom
+
+                if resp.status_code in (502, 503):
+                    last_error = Exception(f"Groq API error {resp.status_code}: {resp.text[:200]}")
                     continue
-                raise
 
-            attempt += 1
+                raise Exception(f"Groq API error {resp.status_code}: {resp.text[:500]}")
 
-        raise Exception("Groq: max retries exceeded")
+            # Every available key was throttled this round. Wait out the short
+            # token window (bounded) rather than stalling for minutes.
+            delay = min(
+                max(wait_hint, 0.5) * (2 ** round_index) + random.uniform(0, 0.5),
+                GROQ_429_MAX_WAIT,
+            )
+            if waited + delay > GROQ_429_TOTAL_WAIT:
+                break
+            waited += delay
+            logger.warning(
+                "Groq rate limited on all %d key(s); waiting %.1fs then retrying "
+                "(%d/%d, %.1fs of %.1fs budget used)",
+                len(ordered), delay, round_index + 1, GROQ_429_MAX_RETRIES,
+                waited, GROQ_429_TOTAL_WAIT,
+            )
+            await asyncio.sleep(delay)
+
+        raise last_error or Exception("Groq: max retries exceeded")
 
 class GeminiProvider(LLMProvider):
     GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"

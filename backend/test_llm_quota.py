@@ -6,6 +6,7 @@ an automatic expiry, and skipped in favour of the fallback provider - never
 retried in a loop that stalls the user's request for minutes.
 """
 import asyncio
+import time
 
 import pytest
 
@@ -26,18 +27,37 @@ class _StubResponse:
         self.text = text
 
 
-def _stub_groq(body: str) -> "lp.GroqProvider":
+class _OkResponse:
+    status_code = 200
+    headers: dict = {}
+    text = ""
+
+    def __init__(self, text):
+        self._text = text
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._text}}]}
+
+
+def _stub_multi_key(keys, responder) -> "lp.GroqProvider":
+    """A GroqProvider with several keys and no real network client."""
     provider = lp.GroqProvider.__new__(lp.GroqProvider)
-    provider.api_key = "test-key"
+    provider.api_keys = list(keys)
+    provider.api_key = keys[0] if keys else None
     provider.default_model = "openai/gpt-oss-120b"
-    provider._quota_exhausted_until = 0.0
+    provider._key_quota_until = [0.0] * len(keys)
+    provider._key_index = 0
 
     class _Client:
-        async def post(self, *args, **kwargs):
-            return _StubResponse(body)
+        async def post(self, url, headers=None, json=None):
+            return responder(headers["Authorization"])
 
     provider._client = _Client()
     return provider
+
+
+def _stub_groq(body: str) -> "lp.GroqProvider":
+    return _stub_multi_key(["test-key"], lambda auth: _StubResponse(body))
 
 
 def test_daily_quota_is_distinguished_from_per_minute():
@@ -64,7 +84,7 @@ def test_daily_quota_latches_and_disables_the_provider():
 
     # Latched: no further network attempts until the window expires.
     assert provider.is_available() is False
-    assert provider._quota_exhausted_until > 0
+    assert provider._key_quota_until[0] > 0
 
 
 def test_router_prefers_an_available_provider_over_an_exhausted_one():
@@ -83,3 +103,31 @@ def test_router_prefers_an_available_provider_over_an_exhausted_one():
     router.fallback_provider = alive
 
     assert router.provider_order() == [alive]
+
+
+def test_a_second_key_is_used_when_the_first_is_daily_exhausted():
+    seen = []
+
+    def respond(auth):
+        seen.append(auth)
+        if auth == "Bearer key-one":
+            return _StubResponse(DAILY_429)
+        return _OkResponse("GENERATED")
+
+    provider = _stub_multi_key(["key-one", "key-two"], respond)
+
+    assert asyncio.run(provider.generate("write a test")) == "GENERATED"
+    assert "Bearer key-one" in seen and "Bearer key-two" in seen
+    assert provider._key_quota_until[0] > time.time()  # first key latched
+    assert provider.is_available() is True             # second key still serves
+
+
+def test_all_keys_exhausted_reports_quota_not_an_endless_retry():
+    provider = _stub_multi_key(
+        ["key-one", "key-two"], lambda auth: _StubResponse(DAILY_429)
+    )
+
+    with pytest.raises(lp.QuotaExhaustedError):
+        asyncio.run(provider.generate("write a test"))
+
+    assert provider.is_available() is False
