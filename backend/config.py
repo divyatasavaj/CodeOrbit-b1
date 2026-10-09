@@ -7,6 +7,7 @@ the pipeline can be scaled without code changes. API keys are never read here
 """
 import os
 from pathlib import Path
+from typing import Any, Dict
 
 from dotenv import load_dotenv
 
@@ -129,6 +130,10 @@ MIN_TEST_COVERAGE = min(100.0, max(0.0, _float("CODEORACLE_MIN_TEST_COVERAGE", 6
 # the legacy improvement-rounds variable is still honoured when it is unset.
 _TOTAL_ATTEMPTS = _int("CODEORACLE_TEST_MAX_ATTEMPTS", 0)
 if _TOTAL_ATTEMPTS <= 0:
+    # Spec-style total-attempt budget. Unset by default, so existing
+    # deployments keep the legacy behaviour below; when set it wins.
+    _TOTAL_ATTEMPTS = _int("TESTGEN_MAX_ATTEMPTS", 0)
+if _TOTAL_ATTEMPTS <= 0:
     _TOTAL_ATTEMPTS = 1 + max(0, _int("CODEORACLE_MAX_TEST_IMPROVEMENT_ATTEMPTS", 2))
 TEST_MAX_ATTEMPTS = max(1, _TOTAL_ATTEMPTS)
 # Extra "improve the tests, then re-run and re-measure" rounds after the first.
@@ -138,3 +143,132 @@ MAX_TEST_IMPROVEMENT_ATTEMPTS = TEST_MAX_ATTEMPTS - 1
 TESTS_CACHE_VERSION = (
     f"{PROMPT_VERSION_TESTS}:mc{int(MIN_TEST_COVERAGE)}:at{TEST_MAX_ATTEMPTS}"
 )
+
+
+# ---------------------------------------------------------------------------
+# Independent AI service configuration
+# ---------------------------------------------------------------------------
+# CodeOracle runs two AI features that must never share credentials, models or
+# failure domains: the repository chatbot (conversational, latency-sensitive)
+# and test generation (long, high-token, correctness-critical). Both are wired
+# through backend/app/services/ai/*. Nothing here is ever sent to the browser
+# and API keys are never logged.
+def _str(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip() or default
+
+
+# Legacy provider-specific variables. They are used ONLY as a fallback so an
+# existing deployment keeps working after this change without new secrets - and
+# never as a cross-service leak, because each service resolves its own key
+# first and keeps its own provider/model/failure state.
+_PROVIDER_KEY_ENV = {
+    "gemini": "GEMINI_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openai_compatible": "OPENAI_COMPATIBLE_API_KEY",
+}
+_PROVIDER_MODEL_ENV = {
+    "gemini": "GEMINI_MODEL",
+    "google": "GEMINI_MODEL",
+    "groq": "GROQ_MODEL",
+    "openai": "OPENAI_MODEL",
+    "openai_compatible": "OPENAI_COMPATIBLE_MODEL",
+}
+_PROVIDER_MODEL_DEFAULT = {
+    # Current, non-deprecated Gemini model. Older names (gemini-2.5-flash,
+    # gemini-2.0-flash) now return 404 for new accounts.
+    "gemini": "gemini-3.8-flash",
+    "google": "gemini-3.8-flash",
+    "groq": "llama-3.1-8b-instant",
+    "openai": "gpt-4o-mini",
+    "openai_compatible": "",
+}
+_PROVIDER_BASE_URL_DEFAULT = {
+    "gemini": "",
+    "google": "",
+    "groq": "https://api.groq.com/openai/v1",
+    "openai": "https://api.openai.com/v1",
+    "openai_compatible": "",
+}
+# Providers a deployment may select without code changes. Anything else needs a
+# new adapter registered in app/services/ai/provider_factory.py.
+SUPPORTED_AI_PROVIDERS = ("gemini", "groq", "openai_compatible")
+
+
+def _ai_service_config(
+    prefix: str,
+    *,
+    default_provider: str,
+    default_temperature: float,
+    default_max_tokens: int,
+) -> Dict[str, Any]:
+    """Resolve one independent AI service configuration from the environment."""
+    provider = _str(f"{prefix}_PROVIDER", default_provider).lower()
+    model = (
+        _str(f"{prefix}_MODEL", "")
+        or _str(_PROVIDER_MODEL_ENV.get(provider, ""), "")
+        or _PROVIDER_MODEL_DEFAULT.get(provider, "")
+    )
+    api_key = _str(f"{prefix}_API_KEY", "") or _str(_PROVIDER_KEY_ENV.get(provider, ""), "")
+    base_url = _str(f"{prefix}_BASE_URL", "") or _PROVIDER_BASE_URL_DEFAULT.get(provider, "")
+    return {
+        "service": prefix.lower(),
+        "provider": provider,
+        "model": model,
+        "api_key": api_key or None,
+        "base_url": base_url or None,
+        "timeout_seconds": max(5.0, _float(f"{prefix}_TIMEOUT_SECONDS", 45.0)),
+        "max_retries": max(0, _int(f"{prefix}_MAX_RETRIES", 2)),
+        "temperature": _float(f"{prefix}_TEMPERATURE", default_temperature),
+        "max_tokens": max(256, _int(f"{prefix}_MAX_TOKENS", default_max_tokens)),
+        "retry_base_delay": max(0.0, _float(f"{prefix}_RETRY_BASE_DELAY", 0.5)),
+        "max_backoff_seconds": max(0.5, _float(f"{prefix}_MAX_BACKOFF_SECONDS", 8.0)),
+    }
+
+
+def chatbot_ai_config() -> Dict[str, Any]:
+    """Chatbot AI configuration - independent from test generation."""
+    return _ai_service_config(
+        "CHATBOT", default_provider="gemini", default_temperature=0.2, default_max_tokens=2048
+    )
+
+
+def testgen_ai_config() -> Dict[str, Any]:
+    """Test-generation AI configuration - independent from the chatbot.
+
+    The default provider stays Gemini because that is what the existing
+    per-function test pipeline used before these settings existed; a deployment
+    that wants another provider only has to set TESTGEN_PROVIDER.
+    """
+    return _ai_service_config(
+        "TESTGEN", default_provider="gemini", default_temperature=0.1, default_max_tokens=4096
+    )
+
+
+# Retrieval / context budget for the chatbot (spec section 9). The chatbot
+# never sends a whole repository: these bound how much source is retrieved per
+# question so latency, cost and context-overflow risk stay predictable.
+CHATBOT_MAX_CONTEXT_ITEMS = max(1, _int("CHATBOT_MAX_CONTEXT_ITEMS", 12))
+CHATBOT_MAX_CONTEXT_CHARS = max(2000, _int("CHATBOT_MAX_CONTEXT_CHARS", 24000))
+CHATBOT_MAX_SOURCE_LINES = max(10, _int("CHATBOT_MAX_SOURCE_LINES", 90))
+CHATBOT_MAX_CITATIONS = max(1, _int("CHATBOT_MAX_CITATIONS", 6))
+CHATBOT_DEPENDENCY_LIMIT = max(0, _int("CHATBOT_DEPENDENCY_LIMIT", 3))
+CHATBOT_GRAPH_SEEDS = max(1, _int("CHATBOT_GRAPH_SEEDS", 4))
+CHATBOT_MAX_HISTORY_MESSAGES = max(2, _int("CHATBOT_MAX_HISTORY_MESSAGES", 12))
+CHATBOT_MAX_HISTORY_CHARS = max(1000, _int("CHATBOT_MAX_HISTORY_CHARS", 6000))
+CHATBOT_MAX_MESSAGE_CHARS = max(200, _int("CHATBOT_MAX_MESSAGE_CHARS", 2000))
+CHATBOT_RATE_LIMIT_PER_MINUTE = max(1, _int("CHATBOT_RATE_LIMIT_PER_MINUTE", 20))
+CHATBOT_MAX_CONCURRENT = max(1, _int("CHATBOT_MAX_CONCURRENT", 2))
+
+_TESTGEN_CFG = testgen_ai_config()
+TESTGEN_TEMPERATURE = _TESTGEN_CFG["temperature"]
+TESTGEN_MAX_TOKENS = _TESTGEN_CFG["max_tokens"]
+TESTGEN_MAX_ATTEMPTS = TEST_MAX_ATTEMPTS
+# Identity of the current test-generation backend. Part of the tests cache key
+# so a suite generated with one provider/model is never replayed as if it came
+# from another.
+TESTGEN_CACHE_ID = f"{_TESTGEN_CFG['provider']}:{_TESTGEN_CFG['model'] or 'unset'}"

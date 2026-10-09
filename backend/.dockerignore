@@ -1,0 +1,14 @@
+# Keep the image small and secret-free.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+cache/
+.env
+.env.*
+!.env.example
+*.log
+conftest.py
+test_*.py
+Dockerfile
+.dockerignore

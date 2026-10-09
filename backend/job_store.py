@@ -26,7 +26,20 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("codeoracle.jobstore")
 
-_ROOT = Path(__file__).parent / "cache" / "jobs"
+# Storage root. Defaults to the app directory for local development; a hosted
+# deployment sets CODEORACLE_DATA_DIR to a writable mounted volume because the
+# application directory is read-only on most PaaS platforms.
+# May be imported before config.py, so load .env here as well; a process env
+# var still wins because load_dotenv does not override existing values.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).parent / ".env")
+except Exception:  # pragma: no cover - dotenv ships with the app
+    pass
+
+_data_dir = os.environ.get("CODEORACLE_DATA_DIR", "").strip()
+_ROOT = (Path(_data_dir) / "cache" / "jobs") if _data_dir else (Path(__file__).parent / "cache" / "jobs")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -153,6 +166,19 @@ def load_artifacts(job_id: str, kind: str) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
             items.append(payload)
     return items
+
+
+def delete_artifact(job_id: str, kind: str, key: str) -> bool:
+    """Remove one stored artifact. Returns False when it did not exist."""
+    path = job_dir(job_id) / kind / f"{_safe(key)}.json"
+    if not path.exists():
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError as exc:  # noqa: BLE001 - deletion is best-effort
+        logger.warning(f"Failed to delete job-store artifact {path}: {exc}")
+        return False
 
 
 # --------------------------------------------------------------------------

@@ -31,6 +31,30 @@ FALLBACK_MODELS = list(dict.fromkeys([config.MODEL, "gemini-3.5-flash"]))
 # refactors, all jobs) so one large repository cannot monopolise the API.
 SEM = asyncio.Semaphore(config.LLM_CONCURRENCY)
 
+# --------------------------------------------------------------------------
+# Test-generation AI service (independent provider configuration)
+# --------------------------------------------------------------------------
+# Test generation no longer shares the explanation/refactor Gemini client: every
+# test prompt goes through TestGenerationService, which owns its own provider,
+# model, API key, timeout, retry policy and attempt budget (TESTGEN_* env vars).
+# Explanations and refactoring keep the original client above, untouched.
+def _test_generation_service():
+    from app.services.ai.test_generation_service import get_test_generation_service
+
+    return get_test_generation_service()
+
+
+async def _generate_tests_text(prompt: str) -> str:
+    """Call the configured test-generation provider (raises on failure)."""
+    return await _test_generation_service().generate_text(prompt)
+
+
+def _safe_provider_error(exc: Exception) -> str:
+    """Sanitized, single-line provider error safe to show in the UI payload."""
+    from app.services.ai.provider_base import sanitize_error_text
+
+    return sanitize_error_text(exc, limit=200) or "AI provider error"
+
 # Quick-results mode: generate full LLM explanations for this fraction of each
 # module's functions, then stop and fall back to the grounded AST engine for the
 # remaining functions (time-optimized: 60%+ coverage instead of chasing 100%).
@@ -869,7 +893,7 @@ Return ONLY the Python test code. No explanation. No markdown fences.
 The test file should be complete and runnable with `pytest`."""
 
     try:
-        test_code = await generate_with_retry(prompt)
+        test_code = await _generate_tests_text(prompt)
         for fence in ("```javascript", "```js", "```python", "```"):
             if test_code.startswith(fence):
                 test_code = test_code[len(fence):].strip()
@@ -877,7 +901,7 @@ The test file should be complete and runnable with `pytest`."""
             test_code = test_code[:-3].strip()
         return test_code
     except Exception as e:
-        return f"# Error generating tests: {str(e)}"
+        return f"# Error generating tests: {_safe_provider_error(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1027,10 +1051,10 @@ async def generate_function_tests(ctx: Dict[str, Any]) -> str:
         )
 
     try:
-        test_code = await generate_with_retry(prompt)
+        test_code = await _generate_tests_text(prompt)
         return _fence_strip(test_code)
     except Exception as e:
-        return f"# Error generating tests: {str(e)}"
+        return f"# Error generating tests: {_safe_provider_error(e)}"
 
 
 async def generate_tests(func: Dict[str, Any]) -> str:
@@ -1055,7 +1079,7 @@ Function:
 ```"""
 
     try:
-        test_code = await generate_with_retry(prompt)
+        test_code = await _generate_tests_text(prompt)
         if test_code.startswith("```python"):
             test_code = test_code[len("```python"):].strip()
         elif test_code.startswith("```"):
@@ -1154,10 +1178,10 @@ Write an IMPROVED pytest suite that is a COMPLETE replacement test file:
 Return ONLY the Python test code. No explanation. No markdown fences."""
 
     try:
-        test_code = await generate_with_retry(prompt)
+        test_code = await _generate_tests_text(prompt)
         return _fence_strip(test_code)
     except Exception as e:
-        return f"# Error generating coverage tests: {str(e)}"
+        return f"# Error generating coverage tests: {_safe_provider_error(e)}"
 
 
 async def refactor_function(func: Dict[str, Any]) -> Dict[str, Any]:

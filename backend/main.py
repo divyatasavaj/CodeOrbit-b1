@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Res
 import cache
 import config
 import job_store
+import chatbot_api
 import ai_pipeline
 import repo_ingest
 import github_import
@@ -354,6 +355,13 @@ def get_job(job_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.debug(f"MongoDB query notice for job {job_id}: {e}")
     return None
+
+
+# Repository chatbot routes (see chatbot_api). The existing job resolver is
+# injected so the chatbot reuses this lookup/authorization path instead of
+# duplicating repository storage, and so access checks stay in one place.
+chatbot_api.configure(get_job)
+app.include_router(chatbot_api.router)
 
 
 def cleanup_stale_extract_dirs(max_age_hours: int = 24):
@@ -2143,7 +2151,7 @@ async def generate_tests_on_demand(job_id: str, payload: Dict[str, Any] = Body(.
             "framework": fw.get("framework"),
         }
         cached_entry = cache.get_operation_cached(
-            "tests", func.get("body", ""), cache_ver, config.MODEL, func_id
+            "tests", func.get("body", ""), cache_ver, config.TESTGEN_CACHE_ID, func_id
         )
         if _cached_test_entry_usable(cached_entry):
             entry = {**cached_entry, "name": function_name, "filename": filename, "cached": True}
@@ -2258,7 +2266,7 @@ async def generate_tests_on_demand(job_id: str, payload: Dict[str, Any] = Body(.
                     "cached": False,
                 }
                 cache.set_operation_cached(
-                    "tests", func.get("body", ""), cache_ver, config.MODEL, entry, func_id
+                    "tests", func.get("body", ""), cache_ver, config.TESTGEN_CACHE_ID, entry, func_id
                 )
 
     async with get_generation_lock(job_id):

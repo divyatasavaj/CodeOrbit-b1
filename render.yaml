@@ -1,0 +1,78 @@
+# Render blueprint for the CodeOracle backend.
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repo.
+# Render reads this file, creates the service below, and asks you for every
+# secret marked  sync: false  (so no secret is ever stored in git).
+#
+# Why the backend is not on Vercel: this service needs a writable disk (job
+# store + LLM cache), accepts ZIP uploads far larger than the serverless body
+# limit, and runs analyses as background tasks for minutes - all of which
+# serverless functions forbid.
+services:
+  - type: web
+    name: codeorbit-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+      # --- Storage -------------------------------------------------------
+      # Left unset on purpose: the job store then defaults to
+      # backend/cache/jobs inside the clone, which is writable but is wiped
+      # on every deploy or restart.
+      # To keep analysed repositories across deploys:
+      #   1. upgrade to a plan that supports disks
+      #   2. Render -> your service -> Disks -> add a disk mounted at /var/data
+      #   3. add the env var  CODEORACLE_DATA_DIR = /var/data
+      # - key: CODEORACLE_DATA_DIR
+      #   value: /var/data
+
+      # --- Repository chatbot (independent AI service #1) ---------------
+      - key: CHATBOT_PROVIDER
+        value: gemini
+      - key: CHATBOT_MODEL
+        value: gemini-3.8-flash
+      - key: CHATBOT_TIMEOUT_SECONDS
+        value: "45"
+      - key: CHATBOT_MAX_RETRIES
+        value: "2"
+      - key: CHATBOT_API_KEY
+        sync: false
+
+      # --- Test generation (independent AI service #2) ------------------
+      - key: TESTGEN_PROVIDER
+        value: gemini
+      - key: TESTGEN_MODEL
+        value: gemini-3.8-flash
+      - key: TESTGEN_TIMEOUT_SECONDS
+        value: "90"
+      - key: TESTGEN_MAX_RETRIES
+        value: "2"
+      - key: TESTGEN_MAX_ATTEMPTS
+        value: "3"
+      - key: TESTGEN_API_KEY
+        sync: false
+
+      # --- Shared / legacy (explanations + refactoring) -----------------
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GROQ_API_KEY
+        sync: false
+
+      # --- Optional: durable job metadata -------------------------------
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: codeorbit
+
+      # --- Upload cap (matches the landing page's "50 MB") --------------
+      - key: CODEORACLE_MAX_ZIP_SIZE_MB
+        value: "50"
