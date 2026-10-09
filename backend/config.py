@@ -68,12 +68,20 @@ MAX_DEPENDENCY_CONTEXT = max(1, _int("CODEORACLE_MAX_DEPENDENCY_CONTEXT", 5))
 AI_ANALYSIS_ENABLED = _bool("CODEORACLE_AI_ENABLED", True)
 AI_MIN_PRIORITY = os.environ.get("CODEORACLE_AI_MIN_PRIORITY", "low").strip().lower()
 
+# Explanation strategy. On by default explanations come from the deterministic,
+# AST-grounded static analyzer: instant, no API key, no rate limit and no
+# per-function latency. Set CODEORACLE_STATIC_EXPLANATIONS=0 to restore
+# LLM-written explanations (tests and refactors are unaffected either way).
+STATIC_EXPLANATIONS = _bool("CODEORACLE_STATIC_EXPLANATIONS", True)
+
 # --------------------------------------------------------------------------
 # Model / prompt versioning (bump to invalidate caches)
 # --------------------------------------------------------------------------
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 PROMPT_VERSION_EXPLANATION = os.environ.get("CODEORACLE_PROMPT_VERSION_EXPLANATION", "explain-v2")
-PROMPT_VERSION_TESTS = os.environ.get("CODEORACLE_PROMPT_VERSION_TESTS", "tests-v2")
+# v3: the placeholder gate now honours measured coverage, so suites that were
+# wrongly recorded as failures under v2 must be regenerated rather than reused.
+PROMPT_VERSION_TESTS = os.environ.get("CODEORACLE_PROMPT_VERSION_TESTS", "tests-v3")
 PROMPT_VERSION_REFACTOR = os.environ.get("CODEORACLE_PROMPT_VERSION_REFACTOR", "refactor-v2")
 
 # --------------------------------------------------------------------------

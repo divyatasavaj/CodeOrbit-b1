@@ -732,9 +732,15 @@ async def run_analysis(job_id: str, extract_dir: str):
         update_job(job_id, {"progress": f"Building dependency graph ({len(registry)} functions)..."})
 
         with monitor.timer("dependency_graph"):
+            graph_filter = dependency_analyzer.GraphFilter(
+                max_nodes=config.MAX_GRAPH_NODES,
+                cluster_by_file=True,
+                max_external_nodes=20,
+            )
+
             def _build_graph():
                 dependency_graph = dependency_analyzer.build_dependency_graph(
-                    parsed_files, max_nodes=config.MAX_GRAPH_NODES
+                    parsed_files, max_nodes=config.MAX_GRAPH_NODES, graph_filter=graph_filter
                 )
                 return dependency_graph.to_dict(), dependency_analyzer.get_graph_stats(dependency_graph)
 
@@ -1346,11 +1352,63 @@ async def job_function_explanation(job_id: str, function_id: str):
 
 
 @app.get("/jobs/{job_id}/graph")
-async def job_graph(job_id: str):
-    """Lazy dependency-graph payload - fetched only when the graph tab opens."""
+async def job_graph(job_id: str,
+                    max_nodes: int = 250,
+                    node_types: Optional[str] = None,
+                    files: Optional[str] = None,
+                    min_degree: int = 0,
+                    max_external: int = 20,
+                    cluster: Optional[bool] = None):
+    """Dependency-graph payload for a job.
+
+    With no filter arguments this returns the stored graph, loaded lazily from
+    the job store so the payload is only fetched when the graph tab opens.
+
+    When filter arguments are supplied and the original sources are still on
+    disk the graph is rebuilt with the requested node type / file / degree
+    filters and file-based clusters.
+    """
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    has_filter = bool(node_types or files or min_degree > 0) or max_external != 20 \
+        or cluster is not None or max_nodes != 250
+
+    if has_filter:
+        extract_dir = job.get("extract_dir")
+        if extract_dir and os.path.isdir(extract_dir):
+            source_paths, _ = repo_ingest.find_source_files(extract_dir)
+            parsed_files = []
+            for source_file in source_paths:
+                try:
+                    file_hash = cache.get_file_hash(source_file)
+                    cached = cache.get_cached("ast_analysis", file_hash)
+                    if cached:
+                        parsed_files.append(cached)
+                    elif source_file.endswith(".py"):
+                        parsed_files.append(ast_analyzer.analyze_file(source_file).to_dict())
+                    elif source_file.endswith((".js", ".ts", ".jsx", ".tsx")):
+                        parsed_files.append(js_parser.parse_javascript_file(source_file))
+                except Exception:
+                    continue
+
+            graph_filter = dependency_analyzer.GraphFilter(
+                max_nodes=max_nodes,
+                node_types=set(node_types.split(",")) if node_types else None,
+                files=set(files.split(",")) if files else None,
+                min_degree=min_degree,
+                max_external_nodes=max_external,
+                cluster_by_file=(cluster if cluster is not None else True),
+            )
+            dependency_graph = await asyncio.to_thread(
+                dependency_analyzer.build_dependency_graph,
+                parsed_files,
+                max_nodes=max_nodes,
+                graph_filter=graph_filter,
+            )
+            return dependency_graph.to_dict()
+
     graph = job.get("graph")
     if not graph:
         graph = await asyncio.to_thread(job_store.load_graph, job_id)
@@ -1807,6 +1865,10 @@ def _test_references_function(test_code: str, func: Dict[str, Any]) -> bool:
             rf"(new\s+{re.escape(cls)}\b\s*\(|{re.escape(cls)}\.__new__\s*\()", test_code
         ):
             return True  # constructor tests may only construct, never name __init__
+        if cls and re.search(rf"\b{re.escape(cls)}\s*\(", test_code):
+            # A plain constructor call (`InventoryItem(...)`) implicitly runs
+            # __init__ / the constructor; naming it explicitly is not required.
+            return True
     except re.error:  # pragma: no cover - re.escape cannot fail, belt and braces
         return name in test_code
     return False
@@ -1957,7 +2019,8 @@ async def _generate_with_min_coverage(
     else:
         test_code = await llm.generate_tests_batch([func], source_code, source_file)
     if not test_code or test_code.startswith("# Error generating tests"):
-        raise ValueError("Test generation returned no usable tests")
+        detail = test_code.split(":", 1)[1].strip() if test_code.startswith("# Error generating tests:") else ""
+        raise ValueError("Test generation returned no usable tests" + (f" - {detail}" if detail else ""))
 
     best_code = test_code
     best_cov: Optional[Dict[str, Any]] = None
@@ -1991,6 +2054,11 @@ async def _generate_with_min_coverage(
                 improved = await llm.generate_tests_for_coverage(
                     func, brief, source_file
                 )
+        except llm.QuotaExhaustedError as exc:
+            # No capacity to improve: keep the best measured suite instead of
+            # burning the remaining attempts on calls that cannot succeed.
+            logger.warning("[TEST] stopping improvement for %s - %s", func_name, exc)
+            break
         except Exception as exc:  # noqa: BLE001 - keep the best measured result
             logger.warning(f"[TEST] improvement attempt failed for {func_name}: {exc}")
             break
@@ -2135,6 +2203,9 @@ async def generate_tests_on_demand(job_id: str, payload: Dict[str, Any] = Body(.
     filename = (payload.get("filename") or "").strip()
     if not function_name or not filename:
         raise HTTPException(status_code=422, detail="function_name and filename are required")
+
+    # User-triggered work: take priority over any running bulk analysis.
+    llm.mark_interactive()
 
     func, source_file, source_code = load_job_function(job, function_name, filename)
     func_id = _function_id_for(func, source_file)
@@ -2294,6 +2365,9 @@ async def refactor_on_demand(job_id: str, payload: Dict[str, Any] = Body(...)):
     is_js = source_file.endswith((".js", ".ts", ".jsx", ".tsx"))
     original_code = func.get("body", "")
     func_id = _function_id_for(func, source_file)
+
+    # User-triggered work: take priority over any running bulk analysis.
+    llm.mark_interactive()
 
     if is_trivial_function(original_code):
         entry = {

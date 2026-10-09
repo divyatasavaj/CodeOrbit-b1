@@ -91,7 +91,8 @@ def _cleanup_coverage_json(source_dir: str) -> None:
 
 def _write_test_file(test_dir: str, test_filename: str, test_code: str, source_dir: str,
                      extra_sys_paths: Optional[List[str]] = None,
-                     stub_imports: Optional[List[str]] = None) -> Optional[str]:
+                     stub_imports: Optional[List[str]] = None,
+                     module_alias: Optional[tuple] = None) -> Optional[str]:
     """Write test file and conftest.py. Returns path or None on error."""
     test_path = os.path.join(test_dir, test_filename)
     try:
@@ -107,6 +108,9 @@ def _write_test_file(test_dir: str, test_filename: str, test_code: str, source_d
             # Appended (not prepended) so the source dir keeps priority.
             lines.append(f"sys.path.append(r'{extra}')")
     lines.append(_python_stub_conftest_block(stub_imports or []))
+    # Runs after stub registration so package modules importing third-party
+    # libraries can still be imported here.
+    lines.append(_python_package_alias_block(module_alias))
     try:
         with open(conftest_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(lines) + "\n")
@@ -114,6 +118,62 @@ def _write_test_file(test_dir: str, test_filename: str, test_code: str, source_d
         pass
 
     return test_path
+
+
+def _detect_python_package(source_file: str) -> tuple:
+    """Return ``(dotted_name, path_entry)`` if ``source_file`` is inside a Python
+    package (a chain of directories containing ``__init__.py``), else ``(None,
+    None)``.
+
+    Generated suites import the file by its bare filename (``import catalog``),
+    which breaks files that use relative imports (``from .common import ...``)
+    because the module is loaded as a top-level module rather than a package
+    member. Knowing the package-qualified name lets the conftest alias the
+    package module onto the bare name so those suites execute and are measured.
+    """
+    if not source_file:
+        return None, None
+    try:
+        source_abs = os.path.abspath(source_file)
+    except Exception:  # noqa: BLE001 - detection is best effort
+        return None, None
+    parts: List[str] = []
+    directory = os.path.dirname(source_abs)
+    while directory and os.path.isfile(os.path.join(directory, "__init__.py")):
+        parts.append(os.path.basename(directory))
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    if not parts:
+        return None, None
+    parts.reverse()  # top-most package -> innermost package
+    module = os.path.splitext(os.path.basename(source_abs))[0]
+    dotted = ".".join(parts + [module])
+    path_entry = directory  # parent of the top-most package
+    return dotted, path_entry
+
+
+def _python_package_alias_block(module_alias: Optional[tuple]) -> str:
+    """Conftest snippet aliasing ``package.module`` onto its bare name.
+
+    ``module_alias`` is ``(bare_name, dotted_name)`` as returned from
+    :func:`_detect_python_package`; a no-op when there is no enclosing package.
+    """
+    if not module_alias:
+        return ""
+    bare, dotted = module_alias
+    return f'''
+# Aliasing one package module onto its bare name so a generated
+# `import {bare}` resolves a file that relies on relative imports.
+import sys as __oracle_alias_sys, importlib as __oracle_alias_il
+try:
+    __oracle_alias_sys.modules.setdefault(
+        {bare!r}, __oracle_alias_il.import_module({dotted!r})
+    )
+except Exception:
+    pass
+'''
 
 
 def _parse_coverage_json(test_dir: str, source_file: str) -> Dict[str, Any]:
@@ -1272,10 +1332,19 @@ def run_coverage_for_file(
         project_root = _tf.find_project_root(source_dir)
     except Exception:  # noqa: BLE001 - detection is best effort
         project_root = None
+    # Package-aware import: a file inside a package (e.g. legacy_app/catalog.py)
+    # must be imported as legacy_app.catalog for its relative imports to resolve.
+    package_dotted, package_root = _detect_python_package(source_file)
+    module_alias = None
+    if package_dotted:
+        module = os.path.splitext(os.path.basename(source_file))[0]
+        module_alias = (module, package_dotted)
+    extra_paths = [p for p in (project_root, package_root) if p]
     test_path = _write_test_file(
         test_dir, t_filename, test_code, source_dir,
-        extra_sys_paths=[project_root] if project_root else None,
+        extra_sys_paths=extra_paths or None,
         stub_imports=stub_imports,
+        module_alias=module_alias,
     )
 
     if not test_path:

@@ -7,6 +7,8 @@ that no value is ever faked. Run: python test_cov_gate.py
 import asyncio
 import sys
 import os
+import shutil
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -411,6 +413,40 @@ smoke = main._build_smoke_test(
 check("smoke: module-qualified class", "widget.Widget.__new__" in smoke, smoke)
 check("smoke: passes the placeholder gate",
       main._test_references_function(smoke, {"name": "render"}))
+
+# ---------------- Files inside a package resolve their relative imports
+# (regression: a generated `import catalog` loaded legacy_app/catalog.py as a
+# top-level module, so `from .common import ...` raised ImportError and the
+# suite collected 0 tests at 0% coverage).
+pkg_root = tempfile.mkdtemp(prefix="oracle_pkg_test_")
+try:
+    pkg_dir = os.path.join(pkg_root, "legacy_app")
+    os.makedirs(pkg_dir)
+    open(os.path.join(pkg_dir, "__init__.py"), "w").close()
+    with open(os.path.join(pkg_dir, "common.py"), "w", encoding="utf-8") as fh:
+        fh.write("def safe_text(v):\n    return '' if v is None else str(v)\n")
+    pkg_src = os.path.join(pkg_dir, "catalog.py")
+    with open(pkg_src, "w", encoding="utf-8") as fh:
+        fh.write(
+            "from .common import safe_text\n\n\n"
+            "class CatalogManager:\n"
+            "    def __init__(self, name):\n"
+            "        self.name = safe_text(name)\n"
+        )
+    dotted, path_entry = coverage_runner._detect_python_package(pkg_src)
+    check("package detect: dotted name", dotted == "legacy_app.catalog", dotted)
+    check("package detect: path entry is package parent", path_entry == pkg_root, path_entry)
+    flat_dotted, flat_path = coverage_runner._detect_python_package("/x/standalone.py")
+    check("package detect: flat module has no alias",
+          flat_dotted is None and flat_path is None)
+    pkg_smoke = main._build_smoke_test(
+        {"name": "__init__", "class_name": "CatalogManager", "args": ["name"]}, pkg_src)
+    pkg_res = coverage_runner.run_coverage_for_file(pkg_smoke, pkg_src, "test_catalog.py")
+    check("package suite executes without ImportError",
+          pkg_res["test_results"]["passed"] >= 1 and pkg_res["coverage_percent"] > 0,
+          f"passed={pkg_res['test_results']['passed']} cov={pkg_res['coverage_percent']}")
+finally:
+    shutil.rmtree(pkg_root, ignore_errors=True)
 
 print(f"\n===== {PASS}/{PASS + FAIL} passed =====")
 sys.exit(0 if FAIL == 0 else 1)
