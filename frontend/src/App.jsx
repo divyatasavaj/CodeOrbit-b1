@@ -4,6 +4,8 @@ import GraphTab from "./components/GraphTab.jsx";
 import TestsTab from "./components/TestsTab.jsx";
 import RefactorTab from "./components/RefactorTab.jsx";
 import { API } from "./api.js";
+import RepositoryChatbotWidget from "./components/RepositoryChatbotWidget.jsx";
+import { revealQueryFor } from "./chatbot/chatbotLogic.js";
 
 /* Pagination window for GET /jobs/{id}/functions (spec sections 2, 18). */
 const PAGE_SIZE = 100;
@@ -220,6 +222,13 @@ export default function App() {
             setFnWindow(prev => (prev ? { ...prev, loading: false } : prev));
         });
     }, [jobId, loadWindowPage]);
+
+    /* Chatbot source reference -> reuse the existing server-side function
+       search so the loaded window (and virtualized list) stays small. */
+    const handleCitationNavigate = useCallback((reference) => {
+        setActiveTab("explanation");
+        handleWindowSearch(revealQueryFor(reference));
+    }, [handleWindowSearch]);
 
     const loadMoreWindow = useCallback(() => {
         const id = jobId;
@@ -659,6 +668,16 @@ export default function App() {
                         fileProgress={fileProgress}
                         onSearch={handleWindowSearch}
                         onLoadMore={loadMoreWindow}
+                    />
+                )}
+
+                {view === "results" && results && jobId && (
+                    <RepositoryChatbotWidget
+                        jobId={jobId}
+                        repositoryName={results.repository || results.repository_url || ""}
+                        analysisReady={results.structural_ready === true}
+                        sourceType={results.source_type}
+                        onOpenSourceRef={handleCitationNavigate}
                     />
                 )}
             </main>

@@ -22,8 +22,21 @@ from typing import Any, Optional
 
 logger = logging.getLogger("codeoracle")
 
-_cache_dir = Path(__file__).parent / ".cache"
-_cache_dir.mkdir(exist_ok=True)
+# Storage root. Defaults to the app directory for local development, but a
+# hosted deployment can point it at a mounted volume via CODEORACLE_DATA_DIR
+# because the application directory is read-only on most PaaS platforms.
+# This module may be imported before config.py, so load .env here too - an
+# explicitly set process env var still wins (load_dotenv does not override).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).parent / ".env")
+except Exception:  # pragma: no cover - dotenv ships with the app
+    pass
+
+_data_dir = os.environ.get("CODEORACLE_DATA_DIR", "").strip()
+_cache_dir = (Path(_data_dir) / ".cache") if _data_dir else (Path(__file__).parent / ".cache")
+_cache_dir.mkdir(parents=True, exist_ok=True)
 
 _MEMORY_CACHE_MAX = int(os.environ.get("CODEORACLE_CACHE_MEMORY_MAX", "2000"))
 _memory_cache: "OrderedDict[str, Any]" = OrderedDict()
