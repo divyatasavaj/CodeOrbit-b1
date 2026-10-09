@@ -277,7 +277,7 @@ const FunctionRow = React.memo(function FunctionRow({ func, expanded, onToggle, 
                     {AI_DONE.has(func.ai_status) && func.ai_status !== "ai" && func.ai_status !== "cached" && (
                         <span
                             className="text-[10px] uppercase tracking-wider font-semibold text-gray-500 bg-gray-700/40 border border-gray-600/50 rounded px-1.5 py-0.5"
-                            title={func.ai_status === "trivial_skipped" ? "Deterministic explanation (trivial function)" : "Deterministic explanation (AI fallback)"}
+                            title={func.ai_status === "trivial_skipped" ? "Deterministic explanation (trivial function)" : "Deterministic explanation (static AST analysis, no AI call)"}
                         >
                             {func.ai_status === "trivial_skipped" ? "Trivial" : "Static"}
                         </span>

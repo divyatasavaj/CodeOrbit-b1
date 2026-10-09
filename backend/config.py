@@ -67,6 +67,12 @@ MAX_DEPENDENCY_CONTEXT = max(1, _int("CODEORACLE_MAX_DEPENDENCY_CONTEXT", 5))
 AI_ANALYSIS_ENABLED = _bool("CODEORACLE_AI_ENABLED", True)
 AI_MIN_PRIORITY = os.environ.get("CODEORACLE_AI_MIN_PRIORITY", "low").strip().lower()
 
+# Explanation strategy. On by default explanations come from the deterministic,
+# AST-grounded static analyzer: instant, no API key, no rate limit and no
+# per-function latency. Set CODEORACLE_STATIC_EXPLANATIONS=0 to restore
+# LLM-written explanations (tests and refactors are unaffected either way).
+STATIC_EXPLANATIONS = _bool("CODEORACLE_STATIC_EXPLANATIONS", True)
+
 # --------------------------------------------------------------------------
 # Model / prompt versioning (bump to invalidate caches)
 # --------------------------------------------------------------------------

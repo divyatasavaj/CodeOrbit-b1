@@ -231,18 +231,22 @@ def _persist_batch_sync(job_id: str, batch: List[Any], parsed: Dict[str, Any], e
     for func in batch:
         explanation = parsed.get(func.id)
         if explanation:
-            try:
-                cache.set_operation_cached(
-                    "explanation",
-                    func.source_code,
-                    config.PROMPT_VERSION_EXPLANATION,
-                    config.MODEL,
-                    explanation,
-                    func.id,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            ai_status = "ai"
+            # Static explanations are free to recompute, so they are never
+            # written to the LLM result cache (that would poison it for a later
+            # run with CODEORACLE_STATIC_EXPLANATIONS=0).
+            if not config.STATIC_EXPLANATIONS:
+                try:
+                    cache.set_operation_cached(
+                        "explanation",
+                        func.source_code,
+                        config.PROMPT_VERSION_EXPLANATION,
+                        config.MODEL,
+                        explanation,
+                        func.id,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            ai_status = "ast_fallback" if config.STATIC_EXPLANATIONS else "ai"
         else:
             explanation = _ast_fallback(func)
             ai_status = "ast_fallback"
@@ -284,7 +288,8 @@ def _ast_fallback(func) -> Dict[str, Any]:
 
 async def _call_batch(state: JobState, batch: List[Any], strict: bool) -> Dict[str, Any]:
     """One LLM request. Returns {function_id: validated explanation}."""
-    state.llm_calls += 1
+    if not config.STATIC_EXPLANATIONS:
+        state.llm_calls += 1
     state.in_flight += 1
     state.max_concurrency = max(state.max_concurrency, state.in_flight)
     try:
