@@ -13,7 +13,7 @@ from google import genai
 
 import config
 import function_registry as registry_mod
-from llm_provider import get_llm_provider
+from llm_provider import QuotaExhaustedError, get_llm_provider
 
 logger = logging.getLogger("codeoracle")
 
@@ -201,6 +201,11 @@ async def generate_with_retry(prompt: str, retries: Optional[int] = None,
         for attempt in range(retries):
             try:
                 return await _router_generate(prompt)
+            except QuotaExhaustedError as exc:
+                # Every provider is out of capacity. Retrying cannot help and
+                # only makes the user wait, so surface it immediately.
+                logger.warning("LLM quota exhausted: %s", exc)
+                raise
             except Exception as exc:  # noqa: BLE001 - retry, then fall back
                 router_error = exc
                 if attempt < retries - 1:
@@ -1047,6 +1052,8 @@ The test file should be complete and runnable with `pytest`."""
         if test_code.endswith("```"):
             test_code = test_code[:-3].strip()
         return test_code
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         return f"# Error generating tests: {str(e)}"
 
@@ -1200,6 +1207,10 @@ async def generate_function_tests(ctx: Dict[str, Any]) -> str:
     try:
         test_code = await generate_with_retry(prompt)
         return _fence_strip(test_code)
+    except QuotaExhaustedError:
+        # Out of capacity is not a generation defect: let the caller report the
+        # real reason instead of "no usable tests".
+        raise
     except Exception as e:
         return f"# Error generating tests: {str(e)}"
 

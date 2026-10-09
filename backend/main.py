@@ -2007,7 +2007,8 @@ async def _generate_with_min_coverage(
     else:
         test_code = await llm.generate_tests_batch([func], source_code, source_file)
     if not test_code or test_code.startswith("# Error generating tests"):
-        raise ValueError("Test generation returned no usable tests")
+        detail = test_code.split(":", 1)[1].strip() if test_code.startswith("# Error generating tests:") else ""
+        raise ValueError("Test generation returned no usable tests" + (f" - {detail}" if detail else ""))
 
     best_code = test_code
     best_cov: Optional[Dict[str, Any]] = None
