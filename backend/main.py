@@ -1857,6 +1857,10 @@ def _test_references_function(test_code: str, func: Dict[str, Any]) -> bool:
             rf"(new\s+{re.escape(cls)}\b\s*\(|{re.escape(cls)}\.__new__\s*\()", test_code
         ):
             return True  # constructor tests may only construct, never name __init__
+        if cls and re.search(rf"\b{re.escape(cls)}\s*\(", test_code):
+            # A plain constructor call (`InventoryItem(...)`) implicitly runs
+            # __init__ / the constructor; naming it explicitly is not required.
+            return True
     except re.error:  # pragma: no cover - re.escape cannot fail, belt and braces
         return name in test_code
     return False
@@ -2042,6 +2046,11 @@ async def _generate_with_min_coverage(
                 improved = await llm.generate_tests_for_coverage(
                     func, brief, source_file
                 )
+        except llm.QuotaExhaustedError as exc:
+            # No capacity to improve: keep the best measured suite instead of
+            # burning the remaining attempts on calls that cannot succeed.
+            logger.warning("[TEST] stopping improvement for %s - %s", func_name, exc)
+            break
         except Exception as exc:  # noqa: BLE001 - keep the best measured result
             logger.warning(f"[TEST] improvement attempt failed for {func_name}: {exc}")
             break

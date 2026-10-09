@@ -78,7 +78,9 @@ STATIC_EXPLANATIONS = _bool("CODEORACLE_STATIC_EXPLANATIONS", True)
 # --------------------------------------------------------------------------
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 PROMPT_VERSION_EXPLANATION = os.environ.get("CODEORACLE_PROMPT_VERSION_EXPLANATION", "explain-v2")
-PROMPT_VERSION_TESTS = os.environ.get("CODEORACLE_PROMPT_VERSION_TESTS", "tests-v2")
+# v3: the placeholder gate now honours measured coverage, so suites that were
+# wrongly recorded as failures under v2 must be regenerated rather than reused.
+PROMPT_VERSION_TESTS = os.environ.get("CODEORACLE_PROMPT_VERSION_TESTS", "tests-v3")
 PROMPT_VERSION_REFACTOR = os.environ.get("CODEORACLE_PROMPT_VERSION_REFACTOR", "refactor-v2")
 
 # --------------------------------------------------------------------------

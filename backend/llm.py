@@ -1338,6 +1338,8 @@ Return ONLY the Python test code. No explanation. No markdown fences."""
     try:
         test_code = await generate_with_retry(prompt)
         return _fence_strip(test_code)
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         return f"# Error generating coverage tests: {str(e)}"
 
